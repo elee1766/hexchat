@@ -30,7 +30,6 @@
 #include "dh1080.h"
 
 #include <openssl/bn.h>
-#include <openssl/dh.h>
 #include <openssl/sha.h>
 
 #include <string.h>
@@ -55,184 +54,235 @@ static const guchar prime1080[DH1080_PRIME_BYTES] =
 	0xA9, 0xAE, 0x29, 0x9E, 0xFA, 0x7B, 0xA6, 0x6D, 0xEA, 0xFE, 0xFB, 0xEF, 0xBF, 0x0B, 0x7D, 0x8B
 };
 
-static DH *g_dh;
+/* Implemented directly on BIGNUM arithmetic: the low-level DH_* API is
+ * deprecated since OpenSSL 3.0 and the DH1080 prime is not a standard group
+ * (an EVP/provider DH key for it needs OSSL_PARAM construction that only
+ * exists in OpenSSL >= 3.0, while this project still builds against 1.1).
+ *
+ * Side channels: both modular exponentiations take a SECRET exponent (our
+ * private key). BN_mod_exp() is variable-time for such exponents unless the
+ * caller sets BN_FLG_CONSTTIME, so we call BN_mod_exp_mont_consttime()
+ * directly (valid because p is an odd prime) and also flag the exponent
+ * BN_FLG_CONSTTIME. This is what OpenSSL's own DH_generate_key() and
+ * DH_compute_key() did for the previous implementation of this file.
+ * Secrets live in BN_secure_new() bignums (secure heap when OpenSSL has one,
+ * ordinary heap otherwise), are freed with BN_clear_free(), and every
+ * temporary buffer holding key material is OPENSSL_cleanse()d.
+ */
+static BIGNUM *g_p;
+static BIGNUM *g_g;
 
 int
 dh1080_init (void)
 {
-	g_return_val_if_fail (g_dh == NULL, 0);
+	BIGNUM *q = NULL;
+	BN_CTX *ctx = NULL;
+	int ok = 0;
 
-	if ((g_dh = DH_new()))
-	{
-		int codes;
-		BIGNUM *p, *g;
+	g_return_val_if_fail (g_p == NULL, 0);
 
-		p = BN_bin2bn (prime1080, DH1080_PRIME_BYTES, NULL);
-		g = BN_new ();
+	g_p = BN_bin2bn (prime1080, DH1080_PRIME_BYTES, NULL);
+	g_g = BN_new ();
+	q = BN_new ();
+	ctx = BN_CTX_new ();
 
-		if (p == NULL || g == NULL)
-			return 1;
+	if (g_p && g_g && q && ctx
+	    && BN_is_odd (g_p)
+	    && BN_set_word (g_g, 2)
+	    && BN_rshift1 (q, g_p)
+	    /* p must be a safe prime: p and (p-1)/2 both prime */
+	    && BN_check_prime (g_p, ctx, NULL) == 1
+	    && BN_check_prime (q, ctx, NULL) == 1)
+		ok = 1;
 
-		BN_set_word (g, 2);
-
-#ifndef HAVE_DH_SET0_PQG
-		g_dh->p = p;
-		g_dh->g = g;
-#else
-		if (!DH_set0_pqg (g_dh, p, NULL, g))
-			return 1;
-#endif
-
-		if (DH_check (g_dh, &codes))
-			return codes == 0;
-	}
-
-	return 0;
+	BN_free (q);
+	BN_CTX_free (ctx);
+	if (!ok)
+		dh1080_deinit ();
+	return ok;
 }
 
 void
 dh1080_deinit (void)
 {
-	g_clear_pointer (&g_dh, DH_free);
+	g_clear_pointer (&g_p, BN_free);
+	g_clear_pointer (&g_g, BN_free);
 }
 
-static inline int
-DH_verifyPubKey (BIGNUM *pk)
+/* Public key must be in the range 1 < pk < p-1 */
+static int
+DH_verifyPubKey (const BIGNUM *pk)
 {
-	int codes;
-	return DH_check_pub_key (g_dh, pk, &codes) && codes == 0;
+	BIGNUM *pm1 = BN_dup (g_p);
+	int ok = 0;
+
+	if (pm1 && BN_sub_word (pm1, 1))
+		ok = !BN_is_negative (pk) && BN_cmp (pk, BN_value_one ()) > 0 && BN_cmp (pk, pm1) < 0;
+	BN_free (pm1);
+	return ok;
 }
 
-static guchar *
-dh1080_decode_b64 (const char *data, gsize *out_len)
+/* Longest valid unpadded base64 text for a key of DH1080_PRIME_BYTES bytes
+ * (180 chars, or 181 with the trailing 'A' marker used instead of padding). */
+#define DH1080_B64_MAX 181
+
+/* Decode into out[] (at least DH1080_B64_MAX + 8 bytes). Returns the decoded
+ * length, or 0 if the text is empty, too long or not valid base64. Uses only
+ * the caller's fixed-size buffer plus a local one that is cleansed, so secret
+ * keys are never left in reallocated heap copies. */
+static gsize
+dh1080_decode_b64 (const char *data, guchar *out)
 {
-	GString *str = g_string_new (data);
-	guchar *ret;
+	char buf[DH1080_B64_MAX + 4];
+	gsize len = strlen (data), outlen;
+	gint state = 0;
+	guint save = 0;
 
-	if (str->len % 4 == 1 && str->str[str->len - 1] == 'A')
-		g_string_truncate (str, str->len - 1);
+	if (len == 0 || len > DH1080_B64_MAX)
+		return 0;
 
-	while (str->len % 4 != 0)
-		g_string_append_c (str, '=');
+	memcpy (buf, data, len);
+	if (len % 4 == 1 && buf[len - 1] == 'A')
+		len--;
+	while (len % 4 != 0)
+		buf[len++] = '=';
 
-	ret = g_base64_decode_inplace (str->str, out_len);
-	g_string_free (str, FALSE);
-  	return ret;
+	outlen = g_base64_decode_step (buf, len, out, &state, &save);
+	OPENSSL_cleanse (buf, sizeof (buf));
+	if (outlen > DH1080_PRIME_BYTES)
+		return 0;
+	return outlen;
 }
 
 static char *
 dh1080_encode_b64 (const guchar *data, gsize data_len)
 {
-	char *ret = g_base64_encode (data, data_len);
+	/* one allocation, so no stray copy of a private key is left behind */
+	char *ret = g_malloc0 (data_len / 3 * 4 + 8);
+	gint state = 0;
+	guint save = 0;
+	gsize n;
 	char *p;
 
-	if (!(p = strchr (ret, '=')))
-	{
-		char *new_ret = g_new(char, strlen(ret) + 2);
-		strcpy (new_ret, ret);
-		strcat (new_ret, "A");
-		g_free (ret);
-		ret = new_ret;
-	}
-	else
+	n = g_base64_encode_step (data, data_len, FALSE, ret, &state, &save);
+	n += g_base64_encode_close (FALSE, ret + n, &state, &save);
+	ret[n] = '\0';
+	OPENSSL_cleanse (&save, sizeof (save));
+
+	if ((p = strchr (ret, '=')))
 	{
 		*p = '\0';
 	}
+	else
+	{
+		ret[n] = 'A';
+		ret[n + 1] = '\0';
+	}
 
-  	return ret;
+	return ret;
+}
+
+void
+dh1080_free_secret (void *secret)
+{
+	if (secret)
+	{
+		OPENSSL_cleanse (secret, strlen (secret));
+		g_free (secret);
+	}
 }
 
 int
 dh1080_generate_key (char **priv_key, char **pub_key)
 {
 	guchar buf[DH1080_PRIME_BYTES];
-	int len;
-	DH *dh;
-	const BIGNUM *dh_priv_key, *dh_pub_key;
+	int len, ok = 0;
+	BIGNUM *priv = BN_secure_new (), *pub = BN_new (), *range = BN_dup (g_p);
+	BN_CTX *ctx = BN_CTX_new ();
 
-  	g_assert (priv_key != NULL);
+	g_assert (priv_key != NULL);
 	g_assert (pub_key != NULL);
 
-  	dh = DHparams_dup (g_dh);
-	if (!dh)
-		return 0;
-
-	if (!DH_generate_key (dh))
+	/* priv in [2, p-2], pub = g^priv mod p */
+	if (priv && pub && range && ctx
+	    && BN_sub_word (range, 3)
+	    && BN_priv_rand_range (priv, range)
+	    && BN_add_word (priv, 2))
 	{
-		DH_free (dh);
-		return 0;
+		BN_set_flags (priv, BN_FLG_CONSTTIME);
+		if (BN_mod_exp_mont_consttime (pub, g_g, priv, g_p, ctx, NULL))
+		{
+			MEMZERO (buf);
+			len = BN_bn2bin (priv, buf);
+			*priv_key = dh1080_encode_b64 (buf, len);
+
+			MEMZERO (buf);
+			len = BN_bn2bin (pub, buf);
+			*pub_key = dh1080_encode_b64 (buf, len);
+			ok = 1;
+		}
 	}
 
-#ifndef HAVE_DH_GET0_KEY
-	dh_pub_key = dh->pub_key;
-	dh_priv_key = dh->priv_key;
-#else
-	DH_get0_key (dh, &dh_pub_key, &dh_priv_key);
-#endif
-
-	MEMZERO (buf);
-	len = BN_bn2bin (dh_priv_key, buf);
-	*priv_key = dh1080_encode_b64 (buf, len);
-
-	MEMZERO (buf);
-	len = BN_bn2bin (dh_pub_key, buf);
-	*pub_key = dh1080_encode_b64 (buf, len);
-
 	OPENSSL_cleanse (buf, sizeof (buf));
-	DH_free (dh);
-	return 1;
+	BN_clear_free (priv);
+	BN_free (pub);
+	BN_free (range);
+	BN_CTX_free (ctx);
+	return ok;
 }
 
 int
 dh1080_compute_key (const char *priv_key, const char *pub_key, char **secret_key)
 {
-	char *pub_key_data;
-	gsize pub_key_len;
-	BIGNUM *pk;
-	DH *dh;
-#ifdef HAVE_DH_SET0_KEY
-	BIGNUM *temp_pub_key = BN_new();
-#endif
+	guchar pub_data[DH1080_B64_MAX + 8], priv_data[DH1080_B64_MAX + 8];
+	gsize pub_len, priv_len;
+	BIGNUM *pk = NULL, *priv = BN_secure_new (), *shared = BN_secure_new ();
+	BN_CTX *ctx = BN_CTX_new ();
+	int ok = 0;
 
 	g_assert (secret_key != NULL);
 
 	/* Verify base64 strings */
 	if (strspn (priv_key, B64ABC) != strlen (priv_key)
 	    || strspn (pub_key, B64ABC) != strlen (pub_key))
-		return 0;
+		goto out;
 
-	dh = DHparams_dup (g_dh);
+	/* Decoded keys are bounded to DH1080_PRIME_BYTES (and non-empty) */
+	pub_len = dh1080_decode_b64 (pub_key, pub_data);
+	priv_len = dh1080_decode_b64 (priv_key, priv_data);
+	if (pub_len == 0 || priv_len == 0)
+		goto out;
 
-	pub_key_data = dh1080_decode_b64 (pub_key, &pub_key_len);
-	pk = BN_bin2bn (pub_key_data, pub_key_len, NULL);
+	pk = BN_bin2bn (pub_data, pub_len, NULL);
+	if (!pk || !priv || !shared || !ctx
+	    || !BN_bin2bn (priv_data, priv_len, priv))
+		goto out;
 
-	if (DH_verifyPubKey (pk))
+	/* private exponent must be in [1, p-2]; 0 or >= p-1 is never ours */
+	BN_set_flags (priv, BN_FLG_CONSTTIME);
+	if (BN_is_zero (priv) || BN_ucmp (priv, g_p) >= 0)
+		goto out;
+
+	if (DH_verifyPubKey (pk)
+	    && BN_mod_exp_mont_consttime (shared, pk, priv, g_p, ctx, NULL))
 	{
 		guchar shared_key[DH1080_PRIME_BYTES] = { 0 };
 		guchar sha256[SHA256_DIGEST_LENGTH] = { 0 };
-		char *priv_key_data;
-		gsize priv_key_len;
-		int shared_len;
-		BIGNUM *priv_key_num;
+		int shared_len = BN_bn2bin (shared, shared_key);
 
-		priv_key_data = dh1080_decode_b64 (priv_key, &priv_key_len);
-		priv_key_num = BN_bin2bn(priv_key_data, priv_key_len, NULL);
-#ifndef HAVE_DH_SET0_KEY
-		dh->priv_key = priv_key_num;
-#else
-		DH_set0_key (dh, temp_pub_key, priv_key_num);
-#endif
-
-		shared_len = DH_compute_key (shared_key, pk, dh);
-		SHA256(shared_key, shared_len, sha256);
+		SHA256 (shared_key, shared_len, sha256);
 		*secret_key = dh1080_encode_b64 (sha256, sizeof(sha256));
-
-		OPENSSL_cleanse (priv_key_data, priv_key_len);
-		g_free (priv_key_data);
+		OPENSSL_cleanse (shared_key, sizeof (shared_key));
+		OPENSSL_cleanse (sha256, sizeof (sha256));
+		ok = 1;
 	}
 
+out:
+	OPENSSL_cleanse (priv_data, sizeof (priv_data));
+	OPENSSL_cleanse (pub_data, sizeof (pub_data));
 	BN_free (pk);
-	DH_free (dh);
-	g_free (pub_key_data);
-	return 1;
+	BN_clear_free (priv);
+	BN_clear_free (shared);
+	BN_CTX_free (ctx);
+	return ok;
 }

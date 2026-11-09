@@ -1,6 +1,7 @@
 fishlim_test_sources = [
   'tests.c',
   'mock-keystore.c',
+  '../dh1080.c',
   '../fish.c',
   '../utils.c',
 ]

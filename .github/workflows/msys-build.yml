@@ -1,11 +1,13 @@
-name: MSYS2 Build
+name: MSYS2 Build (GTK3 port pending, manual only)
+# Inherited from the GTK2 tree and NOT ported to GTK3: it is expected to fail
+# on this branch. Automatic triggers are disabled; run it by hand only.
+# See docs/maintenance/gtk3-status.md.
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+  workflow_dispatch:
+
+# Read-only token.
+permissions:
+  contents: read
 
 jobs:
   msys2_build:

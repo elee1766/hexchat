@@ -110,3 +110,7 @@ hexchat_plugin_dep = declare_dependency(
   compile_args: common_cflags,
   dependencies: global_deps,
 )
+
+if libssl_dep.found()
+  subdir('tests')
+endif

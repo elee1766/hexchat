@@ -94,7 +94,6 @@ struct textentry
 enum
 {
 	WORD_CLICK,
-	SET_SCROLL_ADJUSTMENTS,
 	LAST_SIGNAL
 };
 
@@ -118,8 +117,6 @@ static char *gtk_xtext_selection_get_text (GtkXText *xtext, int *len_ret);
 static textentry *gtk_xtext_nth (GtkXText *xtext, int line, int *subline);
 static void gtk_xtext_adjustment_changed (GtkAdjustment * adj,
 														GtkXText * xtext);
-static void gtk_xtext_scroll_adjustments (GtkXText *xtext, GtkAdjustment *hadj,
-										GtkAdjustment *vadj);
 static int gtk_xtext_render_ents (GtkXText * xtext, textentry *, textentry *);
 static void gtk_xtext_recalc_widths (xtext_buffer *buf, int);
 static void gtk_xtext_fix_indent (xtext_buffer *buf);
@@ -147,7 +144,160 @@ static void gtk_xtext_search_fini (xtext_buffer *);
 static gboolean gtk_xtext_search_init (xtext_buffer *buf, const gchar *text, gtk_xtext_search_flags flags, GError **perr);
 static char * gtk_xtext_get_word (GtkXText * xtext, int x, int y, textentry ** ret_ent, int *ret_off, int *ret_len, GSList **slp);
 
-#define xtext_draw_bg(xt,x,y,w,h) gdk_draw_rectangle(xt->draw_buf, xt->bgc, 1, x, y, w, h);
+static void
+xtext_get_pointer (GtkWidget *widget, int *x, int *y, GdkModifierType *mask)
+{
+	GdkSeat *seat = gdk_display_get_default_seat (gtk_widget_get_display (widget));
+
+	gdk_window_get_device_position (gtk_widget_get_window (widget),
+											  gdk_seat_get_pointer (seat), x, y, mask);
+}
+
+/* GtkAdjustment fields are private in GTK3; the old code assigned
+ * adj->value directly, which never emitted "value-changed". */
+static void
+xtext_adj_set_value_quiet (GtkXText *xtext, gdouble value)
+{
+	g_signal_handler_block (xtext->adj, xtext->vc_signal_tag);
+	gtk_adjustment_set_value (xtext->adj, value);
+	g_signal_handler_unblock (xtext->adj, xtext->vc_signal_tag);
+}
+
+#define xtext_draw_bg(xt,x,y,w,h) xtext_fill_rect (xt, &(xt)->bgc, x, y, w, h)
+
+/* ======================================= */
+/* ============ CAIRO BACKEND ============ */
+/* ======================================= */
+
+/* All drawing goes to xtext->surface, a backing store the size of the widget.
+ * The draw handler copies it to the screen; everything else that changes the
+ * surface asks for the affected area to be redrawn. */
+
+static void
+xtext_cairo_set_color (cairo_t *cr, const GdkColor *col)
+{
+	cairo_set_source_rgb (cr, col->red / 65535.0, col->green / 65535.0,
+								 col->blue / 65535.0);
+}
+
+static void
+xtext_gc_set_rgb (xtext_gc *gc, guint16 r, guint16 g, guint16 b)
+{
+	gc->fg.red = r;
+	gc->fg.green = g;
+	gc->fg.blue = b;
+}
+
+static void
+xtext_free_surface (GtkXText *xtext)
+{
+	if (xtext->cr)
+	{
+		cairo_destroy (xtext->cr);
+		xtext->cr = NULL;
+	}
+	if (xtext->surface)
+	{
+		cairo_surface_destroy (xtext->surface);
+		xtext->surface = NULL;
+	}
+	xtext->surface_width = xtext->surface_height = 0;
+}
+
+/* make sure the backing surface matches the window size */
+static void
+xtext_ensure_surface (GtkXText *xtext)
+{
+	GtkWidget *widget = GTK_WIDGET (xtext);
+	int w, h;
+
+	if (!gtk_widget_get_realized (widget))
+		return;
+
+	w = gtk_widget_get_allocated_width (widget);
+	h = gtk_widget_get_allocated_height (widget);
+	if (w < 1 || h < 1)
+		return;
+
+	if (xtext->surface && xtext->surface_width == w && xtext->surface_height == h)
+		return;
+
+	xtext_free_surface (xtext);
+	xtext->surface = gdk_window_create_similar_image_surface (
+		gtk_widget_get_window (widget), CAIRO_FORMAT_RGB24, w, h, 0);
+	xtext->cr = cairo_create (xtext->surface);
+	xtext->surface_width = w;
+	xtext->surface_height = h;
+	xtext->need_repaint = TRUE;
+}
+
+static void
+xtext_invalidate (GtkXText *xtext, int x, int y, int w, int h)
+{
+	if (!xtext->painting && gtk_widget_get_realized (GTK_WIDGET (xtext)))
+		gtk_widget_queue_draw_area (GTK_WIDGET (xtext), x, y, w, h);
+}
+
+static void
+xtext_fill_rect (GtkXText *xtext, xtext_gc *gc, int x, int y, int w, int h)
+{
+	cairo_t *cr = xtext->cr;
+
+	if (!cr || w <= 0 || h <= 0)
+		return;
+
+	cairo_save (cr);
+	cairo_rectangle (cr, x, y, w, h);
+	if (gc == &xtext->bgc && xtext->pixmap)
+	{
+		cairo_pattern_t *pat = cairo_pattern_create_for_surface (xtext->pixmap);
+		cairo_matrix_t m;
+
+		cairo_pattern_set_extend (pat, CAIRO_EXTEND_REPEAT);
+		cairo_matrix_init_translate (&m, -xtext->ts_x, -xtext->ts_y);
+		cairo_pattern_set_matrix (pat, &m);
+		cairo_set_source (cr, pat);
+		cairo_pattern_destroy (pat);
+	} else
+	{
+		xtext_cairo_set_color (cr, &gc->fg);
+	}
+	cairo_fill (cr);
+	cairo_restore (cr);
+	xtext_invalidate (xtext, x, y, w, h);
+}
+
+/* copy a rectangle of the backing store onto itself */
+static void
+xtext_scroll_surface (GtkXText *xtext, int src_x, int src_y, int dest_x,
+							 int dest_y, int w, int h)
+{
+	cairo_t *cr = xtext->cr;
+
+	if (!cr || w <= 0 || h <= 0)
+		return;
+
+	cairo_save (cr);
+	cairo_rectangle (cr, dest_x, dest_y, w, h);
+	cairo_clip (cr);
+	/* the group makes an overlapping copy safe */
+	cairo_push_group (cr);
+	cairo_set_source_surface (cr, xtext->surface, dest_x - src_x, dest_y - src_y);
+	cairo_paint (cr);
+	cairo_pop_group_to_source (cr);
+	cairo_set_operator (cr, CAIRO_OPERATOR_SOURCE);
+	cairo_paint (cr);
+	cairo_restore (cr);
+	xtext_invalidate (xtext, dest_x, dest_y, w, h);
+}
+
+/* one pixel wide horizontal or vertical line, both end points included */
+static void
+xtext_draw_line (GtkXText *xtext, xtext_gc *gc, int x1, int y1, int x2, int y2)
+{
+	xtext_fill_rect (xtext, gc, MIN (x1, x2), MIN (y1, y2),
+						  abs (x2 - x1) + 1, abs (y2 - y1) + 1);
+}
 
 /* ======================================= */
 /* ============ PANGO BACKEND ============ */
@@ -354,77 +504,55 @@ backend_get_text_width_slp (GtkXText *xtext, guchar *str, GSList *slp)
 	return width;
 }
 
-/* simplified version of gdk_draw_layout_line_with_colors() */
-
-static void 
-xtext_draw_layout_line (GdkDrawable      *drawable,
-								GdkGC            *gc,
-								gint              x, 
-								gint              y,
-								PangoLayoutLine  *line)
-{
-	GSList *tmp_list = line->runs;
-	PangoRectangle logical_rect;
-	gint x_off = 0;
-
-	while (tmp_list)
-	{
-		PangoLayoutRun *run = tmp_list->data;
-
-		pango_glyph_string_extents (run->glyphs, run->item->analysis.font,
-											 NULL, &logical_rect);
-
-		gdk_draw_glyphs (drawable, gc, run->item->analysis.font,
-							  x + x_off / PANGO_SCALE, y, run->glyphs);
-
-		x_off += logical_rect.width;
-		tmp_list = tmp_list->next;
-	}
-}
-
 static void
-backend_draw_text_emph (GtkXText *xtext, int dofill, GdkGC *gc, int x, int y,
+backend_draw_text_emph (GtkXText *xtext, int dofill, xtext_gc *gc, int x, int y,
 						 char *str, int len, int str_width, int emphasis)
 {
-	GdkGCValues val;
-	GdkColor col;
+	cairo_t *cr = xtext->cr;
 	PangoLayoutLine *line;
+
+	if (!cr)
+		return;
 
 	pango_layout_set_attributes (xtext->layout, attr_lists[emphasis]);
 	pango_layout_set_text (xtext->layout, str, len);
 
 	if (dofill)
 	{
-		gdk_gc_get_values (gc, &val);
-		col.pixel = val.background.pixel;
-		gdk_gc_set_foreground (gc, &col);
-		gdk_draw_rectangle (xtext->draw_buf, gc, 1, x, y -
-									xtext->font->ascent, str_width, xtext->fontsize);
-		col.pixel = val.foreground.pixel;
-		gdk_gc_set_foreground (gc, &col);
+		cairo_save (cr);
+		xtext_cairo_set_color (cr, &gc->bg);
+		cairo_rectangle (cr, x, y - xtext->font->ascent, str_width, xtext->fontsize);
+		cairo_fill (cr);
+		cairo_restore (cr);
 	}
 
-	line = pango_layout_get_lines (xtext->layout)->data;
+	line = pango_layout_get_lines_readonly (xtext->layout)->data;
 
-	xtext_draw_layout_line (xtext->draw_buf, gc, x, y, line);
+	cairo_save (cr);
+	xtext_cairo_set_color (cr, &gc->fg);
+	cairo_move_to (cr, x, y);
+	pango_cairo_show_layout_line (cr, line);
+	cairo_restore (cr);
 }
 
 static void
-xtext_set_fg (GtkXText *xtext, GdkGC *gc, int index)
+xtext_set_fg (GtkXText *xtext, xtext_gc *gc, int index)
 {
-	gdk_gc_set_foreground (gc, &xtext->palette[index]);
+	gc->fg = xtext->palette[index];
 }
 
 static void
-xtext_set_bg (GtkXText *xtext, GdkGC *gc, int index)
+xtext_set_bg (GtkXText *xtext, xtext_gc *gc, int index)
 {
-	gdk_gc_set_background (gc, &xtext->palette[index]);
+	gc->bg = xtext->palette[index];
 }
 
 static void
 gtk_xtext_init (GtkXText * xtext)
 {
 	xtext->pixmap = NULL;
+	xtext->surface = NULL;
+	xtext->cr = NULL;
 	xtext->io_tag = 0;
 	xtext->add_io_tag = 0;
 	xtext->scroll_tag = 0;
@@ -455,7 +583,11 @@ gtk_xtext_init (GtkXText * xtext)
 	xtext->recycle = FALSE;
 	xtext->dont_render = FALSE;
 	xtext->dont_render2 = FALSE;
-	gtk_xtext_scroll_adjustments (xtext, NULL, NULL);
+	gtk_widget_set_has_window (GTK_WIDGET (xtext), TRUE);
+	xtext->adj = GTK_ADJUSTMENT (gtk_adjustment_new (0, 0, 1, 1, 1, 1));
+	g_object_ref_sink (xtext->adj);
+	xtext->vc_signal_tag = g_signal_connect (xtext->adj, "value-changed",
+						G_CALLBACK (gtk_xtext_adjustment_changed), xtext);
 
 	{
 		static const GtkTargetEntry targets[] = {
@@ -478,24 +610,24 @@ gtk_xtext_adjustment_set (xtext_buffer *buf, int fire_signal)
 
 	if (buf->xtext->buffer == buf)
 	{
-		adj->lower = 0;
-		adj->upper = buf->num_lines;
+		gtk_adjustment_set_lower (adj, 0);
+		gtk_adjustment_set_upper (adj, buf->num_lines);
 
-		if (adj->upper == 0)
-			adj->upper = 1;
+		if (gtk_adjustment_get_upper (adj) == 0)
+			gtk_adjustment_set_upper (adj, 1);
 
-		adj->page_size = GTK_WIDGET (buf->xtext)->allocation.height /
-							  buf->xtext->fontsize;
-		adj->page_increment = adj->page_size;
+		gtk_adjustment_set_page_size (adj, gtk_widget_get_allocated_height (GTK_WIDGET (buf->xtext)) /
+							  buf->xtext->fontsize);
+		gtk_adjustment_set_page_increment (adj, gtk_adjustment_get_page_size (adj));
 
-		if (adj->value > adj->upper - adj->page_size)
+		if (gtk_adjustment_get_value (adj) > gtk_adjustment_get_upper (adj) - gtk_adjustment_get_page_size (adj))
 		{
 			buf->scrollbar_down = TRUE;
-			adj->value = adj->upper - adj->page_size;
+			xtext_adj_set_value_quiet (buf->xtext, gtk_adjustment_get_upper (adj) - gtk_adjustment_get_page_size (adj));
 		}
 
-		if (adj->value < 0)
-			adj->value = 0;
+		if (gtk_adjustment_get_value (adj) < 0)
+			xtext_adj_set_value_quiet (buf->xtext, 0);
 
 		if (fire_signal)
 			gtk_adjustment_changed (adj);
@@ -516,15 +648,15 @@ gtk_xtext_adjustment_changed (GtkAdjustment * adj, GtkXText * xtext)
 	if (!gtk_widget_get_realized (GTK_WIDGET (xtext)))
 		return;
 
-	if (xtext->buffer->old_value != xtext->adj->value)
+	if (xtext->buffer->old_value != gtk_adjustment_get_value (xtext->adj))
 	{
-		if (xtext->adj->value >= xtext->adj->upper - xtext->adj->page_size)
+		if (gtk_adjustment_get_value (xtext->adj) >= gtk_adjustment_get_upper (xtext->adj) - gtk_adjustment_get_page_size (xtext->adj))
 			xtext->buffer->scrollbar_down = TRUE;
 		else
 			xtext->buffer->scrollbar_down = FALSE;
 
-		if (xtext->adj->value + 1 == xtext->buffer->old_value ||
-			 xtext->adj->value - 1 == xtext->buffer->old_value)	/* clicked an arrow? */
+		if (gtk_adjustment_get_value (xtext->adj) + 1 == xtext->buffer->old_value ||
+			 gtk_adjustment_get_value (xtext->adj) - 1 == xtext->buffer->old_value)	/* clicked an arrow? */
 		{
 			if (xtext->io_tag)
 			{
@@ -541,7 +673,7 @@ gtk_xtext_adjustment_changed (GtkAdjustment * adj, GtkXText * xtext)
 															xtext);
 		}
 	}
-	xtext->buffer->old_value = adj->value;
+	xtext->buffer->old_value = gtk_adjustment_get_value (adj);
 }
 
 GtkWidget *
@@ -555,14 +687,13 @@ gtk_xtext_new (GdkColor palette[], int separator)
 	xtext->buffer = gtk_xtext_buffer_new (xtext);
 	xtext->orig_buffer = xtext->buffer;
 
-	gtk_widget_set_double_buffered (GTK_WIDGET (xtext), FALSE);
 	gtk_xtext_set_palette (xtext, palette);
 
 	return GTK_WIDGET (xtext);
 }
 
 static void
-gtk_xtext_destroy (GtkObject * object)
+gtk_xtext_destroy (GtkWidget * object)
 {
 	GtkXText *xtext = GTK_XTEXT (object);
 
@@ -586,7 +717,7 @@ gtk_xtext_destroy (GtkObject * object)
 
 	if (xtext->pixmap)
 	{
-		g_object_unref (xtext->pixmap);
+		cairo_surface_destroy (xtext->pixmap);
 		xtext->pixmap = NULL;
 	}
 
@@ -600,56 +731,21 @@ gtk_xtext_destroy (GtkObject * object)
 	{
 		g_signal_handlers_disconnect_matched (G_OBJECT (xtext->adj),
 					G_SIGNAL_MATCH_DATA, 0, 0, NULL, NULL, xtext);
-	/*	gtk_signal_disconnect_by_data (G_OBJECT (xtext->adj), xtext);*/
 		g_object_unref (G_OBJECT (xtext->adj));
 		xtext->adj = NULL;
 	}
 
-	if (xtext->bgc)
-	{
-		g_object_unref (xtext->bgc);
-		xtext->bgc = NULL;
-	}
-
-	if (xtext->fgc)
-	{
-		g_object_unref (xtext->fgc);
-		xtext->fgc = NULL;
-	}
-
-	if (xtext->light_gc)
-	{
-		g_object_unref (xtext->light_gc);
-		xtext->light_gc = NULL;
-	}
-
-	if (xtext->dark_gc)
-	{
-		g_object_unref (xtext->dark_gc);
-		xtext->dark_gc = NULL;
-	}
-
-	if (xtext->thin_gc)
-	{
-		g_object_unref (xtext->thin_gc);
-		xtext->thin_gc = NULL;
-	}
-
-	if (xtext->marker_gc)
-	{
-		g_object_unref (xtext->marker_gc);
-		xtext->marker_gc = NULL;
-	}
+	xtext_free_surface (xtext);
 
 	if (xtext->hand_cursor)
 	{
-		gdk_cursor_unref (xtext->hand_cursor);
+		g_object_unref (xtext->hand_cursor);
 		xtext->hand_cursor = NULL;
 	}
 
 	if (xtext->resize_cursor)
 	{
-		gdk_cursor_unref (xtext->resize_cursor);
+		g_object_unref (xtext->resize_cursor);
 		xtext->resize_cursor = NULL;
 	}
 
@@ -659,20 +755,32 @@ gtk_xtext_destroy (GtkObject * object)
 		xtext->orig_buffer = NULL;
 	}
 
-	if (GTK_OBJECT_CLASS (parent_class)->destroy)
-		(*GTK_OBJECT_CLASS (parent_class)->destroy) (object);
+	if (GTK_WIDGET_CLASS (parent_class)->destroy)
+		GTK_WIDGET_CLASS (parent_class)->destroy (object);
 }
 
 static void
 gtk_xtext_unrealize (GtkWidget * widget)
 {
-	backend_deinit (GTK_XTEXT (widget));
+	GtkXText *xtext = GTK_XTEXT (widget);
 
-	/* if there are still events in the queue, this'll avoid segfault */
-	gdk_window_set_user_data (widget->window, NULL);
+	backend_deinit (xtext);
+	xtext_free_surface (xtext);
 
-	if (parent_class->unrealize)
-		(* GTK_WIDGET_CLASS (parent_class)->unrealize) (widget);
+	if (xtext->hand_cursor)
+	{
+		g_object_unref (xtext->hand_cursor);
+		xtext->hand_cursor = NULL;
+	}
+
+	if (xtext->resize_cursor)
+	{
+		g_object_unref (xtext->resize_cursor);
+		xtext->resize_cursor = NULL;
+	}
+
+	/* the parent class destroys the GdkWindow */
+	GTK_WIDGET_CLASS (parent_class)->unrealize (widget);
 }
 
 static void
@@ -680,98 +788,63 @@ gtk_xtext_realize (GtkWidget * widget)
 {
 	GtkXText *xtext;
 	GdkWindowAttr attributes;
-	GdkGCValues val;
-	GdkColor col;
-	GdkColormap *cmap;
+	GdkWindow *window;
+	GtkAllocation allocation;
 
 	gtk_widget_set_realized (widget, TRUE);
 	xtext = GTK_XTEXT (widget);
 
-	attributes.x = widget->allocation.x;
-	attributes.y = widget->allocation.y;
-	attributes.width = widget->allocation.width;
-	attributes.height = widget->allocation.height;
+	gtk_widget_get_allocation (widget, &allocation);
+	attributes.x = allocation.x;
+	attributes.y = allocation.y;
+	attributes.width = allocation.width;
+	attributes.height = allocation.height;
 	attributes.wclass = GDK_INPUT_OUTPUT;
 	attributes.window_type = GDK_WINDOW_CHILD;
 	attributes.event_mask = gtk_widget_get_events (widget) |
 		GDK_EXPOSURE_MASK | GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK
-		| GDK_POINTER_MOTION_MASK | GDK_LEAVE_NOTIFY_MASK;
-
-	cmap = gtk_widget_get_colormap (widget);
-	attributes.colormap = cmap;
+		| GDK_POINTER_MOTION_MASK | GDK_LEAVE_NOTIFY_MASK | GDK_SCROLL_MASK;
 	attributes.visual = gtk_widget_get_visual (widget);
 
-	widget->window = gdk_window_new (widget->parent->window, &attributes,
-												GDK_WA_X | GDK_WA_Y | GDK_WA_VISUAL |
-												GDK_WA_COLORMAP);
-
-	gdk_window_set_user_data (widget->window, widget);
-
-	xtext->depth = gdk_window_get_visual (widget->window)->depth;
-
-	val.subwindow_mode = GDK_INCLUDE_INFERIORS;
-	val.graphics_exposures = 0;
-
-	xtext->bgc = gdk_gc_new_with_values (widget->window, &val,
-													 GDK_GC_EXPOSURES | GDK_GC_SUBWINDOW);
-	xtext->fgc = gdk_gc_new_with_values (widget->window, &val,
-													 GDK_GC_EXPOSURES | GDK_GC_SUBWINDOW);
-	xtext->light_gc = gdk_gc_new_with_values (widget->window, &val,
-											GDK_GC_EXPOSURES | GDK_GC_SUBWINDOW);
-	xtext->dark_gc = gdk_gc_new_with_values (widget->window, &val,
-											GDK_GC_EXPOSURES | GDK_GC_SUBWINDOW);
-	xtext->thin_gc = gdk_gc_new_with_values (widget->window, &val,
-											GDK_GC_EXPOSURES | GDK_GC_SUBWINDOW);
-	xtext->marker_gc = gdk_gc_new_with_values (widget->window, &val,
-											GDK_GC_EXPOSURES | GDK_GC_SUBWINDOW);
+	window = gdk_window_new (gtk_widget_get_parent_window (widget), &attributes,
+									 GDK_WA_X | GDK_WA_Y | GDK_WA_VISUAL);
+	gtk_widget_set_window (widget, window);
+	gdk_window_set_user_data (window, widget);
 
 	/* for the separator bar (light) */
-	col.red = 0xffff; col.green = 0xffff; col.blue = 0xffff;
-	gdk_colormap_alloc_color (cmap, &col, FALSE, TRUE);
-	gdk_gc_set_foreground (xtext->light_gc, &col);
-
+	xtext_gc_set_rgb (&xtext->light_gc, 0xffff, 0xffff, 0xffff);
 	/* for the separator bar (dark) */
-	col.red = 0x1111; col.green = 0x1111; col.blue = 0x1111;
-	gdk_colormap_alloc_color (cmap, &col, FALSE, TRUE);
-	gdk_gc_set_foreground (xtext->dark_gc, &col);
-
+	xtext_gc_set_rgb (&xtext->dark_gc, 0x1111, 0x1111, 0x1111);
 	/* for the separator bar (thinline) */
-	col.red = 0x8e38; col.green = 0x8e38; col.blue = 0x9f38;
-	gdk_colormap_alloc_color (cmap, &col, FALSE, TRUE);
-	gdk_gc_set_foreground (xtext->thin_gc, &col);
+	xtext_gc_set_rgb (&xtext->thin_gc, 0x8e38, 0x8e38, 0x9f38);
 
 	/* for the marker bar (marker) */
-	gdk_gc_set_foreground (xtext->marker_gc, &xtext->palette[XTEXT_MARKER]);
+	xtext_set_fg (xtext, &xtext->marker_gc, XTEXT_MARKER);
 
-	xtext_set_fg (xtext, xtext->fgc, XTEXT_FG);
-	xtext_set_bg (xtext, xtext->fgc, XTEXT_BG);
-	xtext_set_fg (xtext, xtext->bgc, XTEXT_BG);
-
-	/* draw directly to window */
-	xtext->draw_buf = widget->window;
+	xtext_set_fg (xtext, &xtext->fgc, XTEXT_FG);
+	xtext_set_bg (xtext, &xtext->fgc, XTEXT_BG);
+	xtext_set_fg (xtext, &xtext->bgc, XTEXT_BG);
 
 	if (xtext->pixmap)
-	{
-		gdk_gc_set_tile (xtext->bgc, xtext->pixmap);
-		gdk_gc_set_ts_origin (xtext->bgc, 0, 0);
 		xtext->ts_x = xtext->ts_y = 0;
-		gdk_gc_set_fill (xtext->bgc, GDK_TILED);
-	}
 
-	xtext->hand_cursor = gdk_cursor_new_for_display (gdk_window_get_display (widget->window), GDK_HAND1);
-	xtext->resize_cursor = gdk_cursor_new_for_display (gdk_window_get_display (widget->window), GDK_LEFT_SIDE);
-
-	gdk_window_set_back_pixmap (widget->window, NULL, FALSE);
-	widget->style = gtk_style_attach (widget->style, widget->window);
+	xtext->hand_cursor = gdk_cursor_new_for_display (gdk_window_get_display (window), GDK_HAND1);
+	xtext->resize_cursor = gdk_cursor_new_for_display (gdk_window_get_display (window), GDK_LEFT_SIDE);
 
 	backend_init (xtext);
+	xtext_ensure_surface (xtext);
 }
 
 static void
-gtk_xtext_size_request (GtkWidget * widget, GtkRequisition * requisition)
+gtk_xtext_get_preferred_width (GtkWidget * widget, gint *minimum, gint *natural)
 {
-	requisition->width = 200;
-	requisition->height = 90;
+	*minimum = *natural = 200;
+}
+
+static void
+gtk_xtext_get_preferred_height (GtkWidget * widget, gint *minimum, gint *natural)
+{
+	*minimum = *natural = 90;
 }
 
 static void
@@ -783,14 +856,15 @@ gtk_xtext_size_allocate (GtkWidget * widget, GtkAllocation * allocation)
 	if (allocation->width == xtext->buffer->window_width)
 		height_only = TRUE;
 
-	widget->allocation = *allocation;
+	gtk_widget_set_allocation (widget, allocation);
 	if (gtk_widget_get_realized (GTK_WIDGET(widget)))
 	{
 		xtext->buffer->window_width = allocation->width;
 		xtext->buffer->window_height = allocation->height;
 
-		gdk_window_move_resize (widget->window, allocation->x, allocation->y,
+		gdk_window_move_resize (gtk_widget_get_window (widget), allocation->x, allocation->y,
 										allocation->width, allocation->height);
+		xtext_ensure_surface (xtext);
 		dontscroll (xtext->buffer);	/* force scrolling off */
 		if (!height_only)
 			gtk_xtext_calc_lines (xtext->buffer, FALSE);
@@ -800,8 +874,8 @@ gtk_xtext_size_allocate (GtkWidget * widget, GtkAllocation * allocation)
 			gtk_xtext_adjustment_set (xtext->buffer, FALSE);
 		}
 		if (xtext->buffer->scrollbar_down)
-			gtk_adjustment_set_value (xtext->adj, xtext->adj->upper -
-											  xtext->adj->page_size);
+			gtk_adjustment_set_value (xtext->adj, gtk_adjustment_get_upper (xtext->adj) -
+											  gtk_adjustment_get_page_size (xtext->adj));
 	}
 }
 
@@ -920,7 +994,7 @@ gtk_xtext_find_x (GtkXText * xtext, int x, textentry * ent, int subline,
 	else
 		indent = xtext->buffer->indent;
 
-	if (line > xtext->adj->page_size || line < 0)
+	if (line > gtk_adjustment_get_page_size (xtext->adj) || line < 0)
 	{
 		*out_of_bounds = TRUE;
 		return 0;
@@ -955,7 +1029,7 @@ gtk_xtext_find_char (GtkXText * xtext, int x, int y, int *off, int *out_of_bound
 		y -= xtext->fontsize;
 
 	line = (y + xtext->pixel_offset) / xtext->fontsize;
-	ent = gtk_xtext_nth (xtext, line + (int)xtext->adj->value, &subline);
+	ent = gtk_xtext_nth (xtext, line + (int)gtk_adjustment_get_value (xtext->adj), &subline);
 	if (!ent)
 		return NULL;
 
@@ -971,12 +1045,12 @@ static void
 gtk_xtext_draw_sep (GtkXText * xtext, int y)
 {
 	int x, height;
-	GdkGC *light, *dark;
+	xtext_gc *light, *dark;
 
 	if (y == -1)
 	{
 		y = 0;
-		height = GTK_WIDGET (xtext)->allocation.height;
+		height = gtk_widget_get_allocated_height (GTK_WIDGET (xtext));
 	} else
 	{
 		height = xtext->fontsize;
@@ -985,8 +1059,8 @@ gtk_xtext_draw_sep (GtkXText * xtext, int y)
 	/* draw the separator line */
 	if (xtext->separator && xtext->buffer->indent)
 	{
-		light = xtext->light_gc;
-		dark = xtext->dark_gc;
+		light = &xtext->light_gc;
+		dark = &xtext->dark_gc;
 
 		x = xtext->buffer->indent - ((xtext->space_width + 1) / 2);
 		if (x < 1)
@@ -995,19 +1069,19 @@ gtk_xtext_draw_sep (GtkXText * xtext, int y)
 		if (xtext->thinline)
 		{
 			if (xtext->moving_separator)
-				gdk_draw_line (xtext->draw_buf, light, x, y, x, y + height);
+				xtext_draw_line (xtext, light, x, y, x, y + height);
 			else
-				gdk_draw_line (xtext->draw_buf, xtext->thin_gc, x, y, x, y + height);
+				xtext_draw_line (xtext, &xtext->thin_gc, x, y, x, y + height);
 		} else
 		{
 			if (xtext->moving_separator)
 			{
-				gdk_draw_line (xtext->draw_buf, light, x - 1, y, x - 1, y + height);
-				gdk_draw_line (xtext->draw_buf, dark, x, y, x, y + height);
+				xtext_draw_line (xtext, light, x - 1, y, x - 1, y + height);
+				xtext_draw_line (xtext, dark, x, y, x, y + height);
 			} else
 			{
-				gdk_draw_line (xtext->draw_buf, dark, x - 1, y, x - 1, y + height);
-				gdk_draw_line (xtext->draw_buf, light, x, y, x, y + height);
+				xtext_draw_line (xtext, dark, x - 1, y, x - 1, y + height);
+				xtext_draw_line (xtext, light, x, y, x, y + height);
 			}
 		}
 	}
@@ -1031,9 +1105,9 @@ gtk_xtext_draw_marker (GtkXText * xtext, textentry * ent, int y)
 	else return;
 
 	x = 0;
-	width = GTK_WIDGET (xtext)->allocation.width;
+	width = gtk_widget_get_allocated_width (GTK_WIDGET (xtext));
 
-	gdk_draw_line (xtext->draw_buf, xtext->marker_gc, x, render_y, x + width, render_y);
+	xtext_draw_line (xtext, &xtext->marker_gc, x, render_y, x + width, render_y);
 
 	if (gtk_window_has_toplevel_focus (GTK_WINDOW (gtk_widget_get_toplevel (GTK_WIDGET (xtext)))))
 	{
@@ -1049,8 +1123,8 @@ gtk_xtext_paint (GtkWidget *widget, GdkRectangle *area)
 	int x, y;
 
 	if (area->x == 0 && area->y == 0 &&
-		 area->height == widget->allocation.height &&
-		 area->width == widget->allocation.width)
+		 area->height == gtk_widget_get_allocated_height (widget) &&
+		 area->width == gtk_widget_get_allocated_width (widget))
 	{
 		dontscroll (xtext->buffer);	/* force scrolling off */
 		gtk_xtext_render_page (xtext);
@@ -1078,14 +1152,14 @@ gtk_xtext_paint (GtkWidget *widget, GdkRectangle *area)
 	/* y is the last pixel y location it rendered text at */
 	y = gtk_xtext_render_ents (xtext, ent_start, ent_end);
 
-	if (y && y < widget->allocation.height && !ent_end->next)
+	if (y && y < gtk_widget_get_allocated_height (widget) && !ent_end->next)
 	{
 		GdkRectangle rect;
 
 		rect.x = 0;
 		rect.y = y;
-		rect.width = widget->allocation.width;
-		rect.height = widget->allocation.height - y;
+		rect.width = gtk_widget_get_allocated_width (widget);
+		rect.height = gtk_widget_get_allocated_height (widget) - y;
 
 		/* fill any space below the last line that also intersects with
 			the exposure rectangle */
@@ -1108,9 +1182,32 @@ xit:
 }
 
 static gboolean
-gtk_xtext_expose (GtkWidget * widget, GdkEventExpose * event)
+gtk_xtext_draw (GtkWidget * widget, cairo_t * cr)
 {
-	gtk_xtext_paint (widget, &event->area);
+	GtkXText *xtext = GTK_XTEXT (widget);
+
+	xtext_ensure_surface (xtext);
+	if (!xtext->surface)
+		return FALSE;
+
+	if (xtext->need_repaint)
+	{
+		GdkRectangle area;
+
+		/* new, empty backing store: render everything into it */
+		xtext->need_repaint = FALSE;
+		area.x = area.y = 0;
+		area.width = xtext->surface_width;
+		area.height = xtext->surface_height;
+		xtext->painting = TRUE;
+		gtk_xtext_paint (widget, &area);
+		xtext->painting = FALSE;
+	}
+
+	/* GTK already clipped cr to the exposed region */
+	cairo_set_source_surface (cr, xtext->surface, 0, 0);
+	cairo_paint (cr);
+
 	return FALSE;
 }
 
@@ -1434,13 +1531,13 @@ gtk_xtext_scrolldown_timeout (GtkXText * xtext)
 	xtext_buffer *buf = xtext->buffer;
 	GtkAdjustment *adj = xtext->adj;
 
-	gdk_window_get_pointer (GTK_WIDGET (xtext)->window, 0, &p_y, 0);
+	xtext_get_pointer (GTK_WIDGET (xtext), 0, &p_y, 0);
 	win_height = gdk_window_get_height (gtk_widget_get_window (GTK_WIDGET (xtext)));
 
 	if (buf->last_ent_end == NULL ||	/* If context has changed OR */
 		 buf->pagetop_ent == NULL ||	/* pagetop_ent is reset OR */
 		 p_y <= win_height ||			/* pointer not below bottom margin OR */
-		 adj->value >= adj->upper - adj->page_size) 	/* we're scrolled to bottom */
+		 gtk_adjustment_get_value (adj) >= gtk_adjustment_get_upper (adj) - gtk_adjustment_get_page_size (adj)) 	/* we're scrolled to bottom */
 	{
 		xtext->scroll_tag = 0;
 		return 0;
@@ -1448,8 +1545,7 @@ gtk_xtext_scrolldown_timeout (GtkXText * xtext)
 
 	xtext->select_start_y -= xtext->fontsize;
 	xtext->select_start_adj++;
-	adj->value++;
-	gtk_adjustment_value_changed (adj);
+	gtk_adjustment_set_value (adj, gtk_adjustment_get_value (adj) + 1);
 	gtk_xtext_selection_draw (xtext, NULL, TRUE);
 	gtk_xtext_render_ents (xtext, buf->pagetop_ent->next, buf->last_ent_end);
 	xtext->scroll_tag = g_timeout_add (gtk_xtext_timeout_ms (xtext, p_y - win_height),
@@ -1468,28 +1564,27 @@ gtk_xtext_scrollup_timeout (GtkXText * xtext)
 	GtkAdjustment *adj = xtext->adj;
 	int delta_y;
 
-	gdk_window_get_pointer (GTK_WIDGET (xtext)->window, 0, &p_y, 0);
+	xtext_get_pointer (GTK_WIDGET (xtext), 0, &p_y, 0);
 
 	if (buf->last_ent_start == NULL ||	/* If context has changed OR */
 		 buf->pagetop_ent == NULL ||		/* pagetop_ent is reset OR */
 		 p_y >= 0 ||							/* not above top margin OR */
-		 adj->value == 0)						/* we're scrolled to the top */
+		 gtk_adjustment_get_value (adj) == 0)						/* we're scrolled to the top */
 	{
 		xtext->scroll_tag = 0;
 		return 0;
 	}
 
-	if (adj->value < 0)
+	if (gtk_adjustment_get_value (adj) < 0)
 	{
-		delta_y = adj->value * xtext->fontsize;
-		adj->value = 0;
+		delta_y = gtk_adjustment_get_value (adj) * xtext->fontsize;
 	} else {
 		delta_y = xtext->fontsize;
-		adj->value--;
 	}
+	gtk_adjustment_set_value (adj, gtk_adjustment_get_value (adj) < 0 ? 0 :
+									  gtk_adjustment_get_value (adj) - 1);
 	xtext->select_start_y += delta_y;
-	xtext->select_start_adj = adj->value;
-	gtk_adjustment_value_changed (adj);
+	xtext->select_start_adj = gtk_adjustment_get_value (adj);
 	gtk_xtext_selection_draw (xtext, NULL, TRUE);
 	gtk_xtext_render_ents (xtext, buf->pagetop_ent->prev, buf->last_ent_end);
 	xtext->scroll_tag = g_timeout_add (gtk_xtext_timeout_ms (xtext, p_y),
@@ -1514,22 +1609,22 @@ gtk_xtext_selection_update (GtkXText * xtext, GdkEventMotion * event, int p_y, g
 	win_height = gdk_window_get_height (gtk_widget_get_window (GTK_WIDGET (xtext)));
 
 	/* selecting past top of window, scroll up! */
-	if (p_y < 0 && xtext->adj->value >= 0)
+	if (p_y < 0 && gtk_adjustment_get_value (xtext->adj) >= 0)
 	{
 		gtk_xtext_scrollup_timeout (xtext);
 	}
 
 	/* selecting past bottom of window, scroll down! */
 	else if (p_y > win_height &&
-		 xtext->adj->value < (xtext->adj->upper - xtext->adj->page_size))
+		 gtk_adjustment_get_value (xtext->adj) < (gtk_adjustment_get_upper (xtext->adj) - gtk_adjustment_get_page_size (xtext->adj)))
 	{
 		gtk_xtext_scrolldown_timeout (xtext);
 	}
 	else
 	{
-		moved = (int)xtext->adj->value - xtext->select_start_adj;
+		moved = (int)gtk_adjustment_get_value (xtext->adj) - xtext->select_start_adj;
 		xtext->select_start_y -= (moved * xtext->fontsize);
-		xtext->select_start_adj = xtext->adj->value;
+		xtext->select_start_adj = gtk_adjustment_get_value (xtext->adj);
 		gtk_xtext_selection_draw (xtext, event, render);
 	}
 }
@@ -1636,7 +1731,7 @@ gtk_xtext_leave_notify (GtkWidget * widget, GdkEventCrossing * event)
 		xtext->hilight_start = -1;
 		xtext->hilight_end = -1;
 		xtext->cursor_hand = FALSE;
-		gdk_window_set_cursor (widget->window, 0);
+		gdk_window_set_cursor (gtk_widget_get_window (widget), 0);
 		xtext->hilight_ent = NULL;
 	}
 
@@ -1646,7 +1741,7 @@ gtk_xtext_leave_notify (GtkWidget * widget, GdkEventCrossing * event)
 		xtext->hilight_start = -1;
 		xtext->hilight_end = -1;
 		xtext->cursor_resize = FALSE;
-		gdk_window_set_cursor (widget->window, 0);
+		gdk_window_set_cursor (gtk_widget_get_window (widget), 0);
 		xtext->hilight_ent = NULL;
 	}
 
@@ -1736,11 +1831,11 @@ gtk_xtext_motion_notify (GtkWidget * widget, GdkEventMotion * event)
 	textentry *word_ent;
 	int word_type;
 
-	gdk_window_get_pointer (widget->window, &x, &y, &mask);
+	xtext_get_pointer (GTK_WIDGET (xtext), &x, &y, &mask);
 
 	if (xtext->moving_separator)
 	{
-		if (x < (3 * widget->allocation.width) / 5 && x > 15)
+		if (x < (3 * gtk_widget_get_allocated_width (widget)) / 5 && x > 15)
 		{
 			tmp = xtext->buffer->indent;
 			xtext->buffer->indent = x;
@@ -1749,8 +1844,8 @@ gtk_xtext_motion_notify (GtkWidget * widget, GdkEventMotion * event)
 			{
 				gtk_xtext_recalc_widths (xtext->buffer, FALSE);
 				if (xtext->buffer->scrollbar_down)
-					gtk_adjustment_set_value (xtext->adj, xtext->adj->upper -
-													  xtext->adj->page_size);
+					gtk_adjustment_set_value (xtext->adj, gtk_adjustment_get_upper (xtext->adj) -
+													  gtk_adjustment_get_page_size (xtext->adj));
 				if (!xtext->io_tag)
 					xtext->io_tag = g_timeout_add (REFRESH_TIMEOUT,
 																(GSourceFunc)
@@ -1790,7 +1885,7 @@ gtk_xtext_motion_notify (GtkWidget * widget, GdkEventMotion * event)
 		{
 			if (!xtext->cursor_resize)
 			{
-				gdk_window_set_cursor (GTK_WIDGET (xtext)->window,
+				gdk_window_set_cursor (gtk_widget_get_window (GTK_WIDGET (xtext)),
 										  		xtext->resize_cursor);
 				xtext->cursor_hand = FALSE;
 				xtext->cursor_resize = TRUE;
@@ -1812,7 +1907,7 @@ gtk_xtext_motion_notify (GtkWidget * widget, GdkEventMotion * event)
 		{
 			if (!xtext->cursor_hand)
 			{
-				gdk_window_set_cursor (GTK_WIDGET (xtext)->window,
+				gdk_window_set_cursor (gtk_widget_get_window (GTK_WIDGET (xtext)),
 										  		xtext->hand_cursor);
 				xtext->cursor_hand = TRUE;
 				xtext->cursor_resize = FALSE;
@@ -1918,7 +2013,7 @@ gtk_xtext_button_release (GtkWidget * widget, GdkEventButton * event)
 	{
 		xtext->moving_separator = FALSE;
 		old = xtext->buffer->indent;
-		if (event->x < (4 * widget->allocation.width) / 5 && event->x > 15)
+		if (event->x < (4 * gtk_widget_get_allocated_width (widget)) / 5 && event->x > 15)
 			xtext->buffer->indent = event->x;
 		gtk_xtext_fix_indent (xtext->buffer);
 		if (xtext->buffer->indent != old)
@@ -1990,7 +2085,7 @@ gtk_xtext_button_press (GtkWidget * widget, GdkEventButton * event)
 	unsigned char *word;
 	int line_x, x, y, offset, len;
 
-	gdk_window_get_pointer (widget->window, &x, &y, &mask);
+	xtext_get_pointer (GTK_WIDGET (xtext), &x, &y, &mask);
 
 	if (event->button == 3 || event->button == 2) /* right/middle click */
 	{
@@ -2056,7 +2151,7 @@ gtk_xtext_button_press (GtkWidget * widget, GdkEventButton * event)
 	xtext->button_down = TRUE;
 	xtext->select_start_x = x;
 	xtext->select_start_y = y;
-	xtext->select_start_adj = xtext->adj->value;
+	xtext->select_start_adj = gtk_adjustment_get_value (xtext->adj);
 
 	return FALSE;
 }
@@ -2218,10 +2313,14 @@ gtk_xtext_selection_get (GtkWidget * widget,
 	case TARGET_COMPOUND_TEXT:
 #ifdef GDK_WINDOWING_X11
 		{
-			GdkDisplay *display = gdk_window_get_display (widget->window);
+			GdkDisplay *display = gdk_window_get_display (gtk_widget_get_window (widget));
 			GdkAtom encoding;
 			gint format;
 			gint new_length;
+
+			/* GTK3 can also run on Wayland, where there is no compound text */
+			if (!GDK_IS_X11_DISPLAY (display))
+				goto fallback;
 
 			gdk_x11_display_string_to_compound_text (display, stripped, &encoding,
 												&format, &new_text, &new_length);
@@ -2233,6 +2332,9 @@ gtk_xtext_selection_get (GtkWidget * widget,
 		break;
 #endif
 	default:
+#ifdef GDK_WINDOWING_X11
+	fallback:
+#endif
 		new_text = g_locale_from_utf8 (stripped, len, NULL, &glen, NULL);
 		gtk_selection_data_set (selection_data_ptr, GDK_SELECTION_TYPE_STRING,
 										8, new_text, glen);
@@ -2250,16 +2352,16 @@ gtk_xtext_scroll (GtkWidget *widget, GdkEventScroll *event)
 
 	if (event->direction == GDK_SCROLL_UP)		/* mouse wheel pageUp */
 	{
-		new_value = xtext->adj->value - (xtext->adj->page_increment / 10);
-		if (new_value < xtext->adj->lower)
-			new_value = xtext->adj->lower;
+		new_value = gtk_adjustment_get_value (xtext->adj) - (gtk_adjustment_get_page_increment (xtext->adj) / 10);
+		if (new_value < gtk_adjustment_get_lower (xtext->adj))
+			new_value = gtk_adjustment_get_lower (xtext->adj);
 		gtk_adjustment_set_value (xtext->adj, new_value);
 	}
 	else if (event->direction == GDK_SCROLL_DOWN)	/* mouse wheel pageDn */
 	{
-		new_value = xtext->adj->value + (xtext->adj->page_increment / 10);
-		if (new_value > (xtext->adj->upper - xtext->adj->page_size))
-			new_value = xtext->adj->upper - xtext->adj->page_size;
+		new_value = gtk_adjustment_get_value (xtext->adj) + (gtk_adjustment_get_page_increment (xtext->adj) / 10);
+		if (new_value > (gtk_adjustment_get_upper (xtext->adj) - gtk_adjustment_get_page_size (xtext->adj)))
+			new_value = gtk_adjustment_get_upper (xtext->adj) - gtk_adjustment_get_page_size (xtext->adj);
 		gtk_adjustment_set_value (xtext->adj, new_value);
 	}
 
@@ -2267,44 +2369,13 @@ gtk_xtext_scroll (GtkWidget *widget, GdkEventScroll *event)
 }
 
 static void
-gtk_xtext_scroll_adjustments (GtkXText *xtext, GtkAdjustment *hadj, GtkAdjustment *vadj)
-{
-	/* hadj is ignored entirely */
-
-	if (vadj)
-		g_return_if_fail (GTK_IS_ADJUSTMENT (vadj));
-	else
-		vadj = GTK_ADJUSTMENT(gtk_adjustment_new (0, 0, 1, 1, 1, 1));
-
-	if (xtext->adj && (xtext->adj != vadj))
-	{
-		g_signal_handlers_disconnect_by_func (xtext->adj,
-								gtk_xtext_adjustment_changed,
-								xtext);
-		g_object_unref (xtext->adj);
-	}
-
-	if (xtext->adj != vadj)
-	{
-		xtext->adj = vadj;
-		g_object_ref_sink (xtext->adj);
-
-		xtext->vc_signal_tag = g_signal_connect (xtext->adj, "value-changed",
-							G_CALLBACK (gtk_xtext_adjustment_changed),
-							xtext);
-
-		gtk_xtext_adjustment_changed (xtext->adj, xtext);
-	}
-}
-
-static void
 gtk_xtext_class_init (GtkXTextClass * class)
 {
-	GtkObjectClass *object_class;
+	GObjectClass *object_class;
 	GtkWidgetClass *widget_class;
 	GtkXTextClass *xtext_class;
 
-	object_class = (GtkObjectClass *) class;
+	object_class = (GObjectClass *) class;
 	widget_class = (GtkWidgetClass *) class;
 	xtext_class = (GtkXTextClass *) class;
 
@@ -2319,34 +2390,23 @@ gtk_xtext_class_init (GtkXTextClass * class)
 							_hexchat_marshal_VOID__POINTER_POINTER,
 							G_TYPE_NONE,
 							2, G_TYPE_POINTER, G_TYPE_POINTER);
-	xtext_signals[SET_SCROLL_ADJUSTMENTS] =
-		g_signal_new ("set_scroll_adjustments",
-							G_OBJECT_CLASS_TYPE (object_class),
-							G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
-							G_STRUCT_OFFSET (GtkXTextClass, set_scroll_adjustments),
-							NULL, NULL,
-							_hexchat_marshal_VOID__OBJECT_OBJECT,
-							G_TYPE_NONE,
-							2, GTK_TYPE_ADJUSTMENT, GTK_TYPE_ADJUSTMENT);
 
-	object_class->destroy = gtk_xtext_destroy;
-
+	widget_class->destroy = gtk_xtext_destroy;
 	widget_class->realize = gtk_xtext_realize;
 	widget_class->unrealize = gtk_xtext_unrealize;
-	widget_class->size_request = gtk_xtext_size_request;
+	widget_class->get_preferred_width = gtk_xtext_get_preferred_width;
+	widget_class->get_preferred_height = gtk_xtext_get_preferred_height;
 	widget_class->size_allocate = gtk_xtext_size_allocate;
 	widget_class->button_press_event = gtk_xtext_button_press;
 	widget_class->button_release_event = gtk_xtext_button_release;
 	widget_class->motion_notify_event = gtk_xtext_motion_notify;
 	widget_class->selection_clear_event = (void *)gtk_xtext_selection_kill;
 	widget_class->selection_get = gtk_xtext_selection_get;
-	widget_class->expose_event = gtk_xtext_expose;
+	widget_class->draw = gtk_xtext_draw;
 	widget_class->scroll_event = gtk_xtext_scroll;
 	widget_class->leave_notify_event = gtk_xtext_leave_notify;
-	widget_class->set_scroll_adjustments_signal = xtext_signals[SET_SCROLL_ADJUSTMENTS];
 
 	xtext_class->word_click = NULL;
-	xtext_class->set_scroll_adjustments = gtk_xtext_scroll_adjustments;
 }
 
 GType
@@ -2551,11 +2611,12 @@ gtk_xtext_text_width (GtkXText *xtext, unsigned char *text, int len)
 
 static int
 gtk_xtext_render_flush (GtkXText * xtext, int x, int y, unsigned char *str,
-								int len, GdkGC *gc, int *emphasis)
+								int len, xtext_gc *gc, int *emphasis)
 {
 	int str_width, dofill;
-	GdkDrawable *pix = NULL;
 	int dest_x = 0, dest_y = 0;
+	GdkRectangle clip;
+	GdkRectangle dest;
 
 	if (xtext->dont_render || len < 1 || xtext->hidden)
 		return 0;
@@ -2579,77 +2640,57 @@ gtk_xtext_render_flush (GtkXText * xtext, int x, int y, unsigned char *str,
 			goto dounder;
 	}
 
-	pix = gdk_pixmap_new (xtext->draw_buf, str_width, xtext->fontsize, xtext->depth);
-	if (pix)
-	{
-		dest_x = x;
-		dest_y = y - xtext->font->ascent;
+	if (!xtext->cr)
+		return str_width;
 
-		gdk_gc_set_ts_origin (xtext->bgc, xtext->ts_x - x, xtext->ts_y - dest_y);
-
-		x = 0;
-		y = xtext->font->ascent;
-		xtext->draw_buf = pix;
-	}
+	dest_x = x;
+	dest_y = y - xtext->font->ascent;
 
 	dofill = TRUE;
 
-	/* backcolor is always handled by XDrawImageString */
-	if (!xtext->backcolor && xtext->pixmap)
+	/* only touch what is inside the clip_x/x2/y/y2 rectangle */
+	clip.x = xtext->clip_x;
+	clip.y = xtext->clip_y;
+	clip.width = xtext->clip_x2 - xtext->clip_x;
+	clip.height = xtext->clip_y2 - xtext->clip_y;
+
+	dest.x = dest_x;
+	dest.y = dest_y;
+	dest.width = str_width;
+	dest.height = xtext->fontsize;
+
+	if (gdk_rectangle_intersect (&clip, &dest, &dest))
 	{
-	/* draw the background pixmap behind the text - CAUSES FLICKER HERE!! */
-		xtext_draw_bg (xtext, x, y - xtext->font->ascent, str_width,
-							xtext->fontsize);
-		dofill = FALSE;	/* already drawn the background */
-	}
+		cairo_save (xtext->cr);
+		cairo_rectangle (xtext->cr, dest.x, dest.y, dest.width, dest.height);
+		cairo_clip (xtext->cr);
 
-	backend_draw_text_emph (xtext, dofill, gc, x, y, str, len, str_width, *emphasis);
+		/* backcolor is always filled by backend_draw_text_emph */
+		if (!xtext->backcolor && xtext->pixmap)
+		{
+			/* draw the background pixmap behind the text */
+			xtext_draw_bg (xtext, x, y - xtext->font->ascent, str_width,
+								xtext->fontsize);
+			dofill = FALSE;	/* already drawn the background */
+		}
 
-	if (pix)
-	{
-		GdkRectangle clip;
-		GdkRectangle dest;
-
-		gdk_gc_set_ts_origin (xtext->bgc, xtext->ts_x, xtext->ts_y);
-		xtext->draw_buf = GTK_WIDGET (xtext)->window;
-		clip.x = xtext->clip_x;
-		clip.y = xtext->clip_y;
-		clip.width = xtext->clip_x2 - xtext->clip_x;
-		clip.height = xtext->clip_y2 - xtext->clip_y;
-
-		dest.x = dest_x;
-		dest.y = dest_y;
-		dest.width = str_width;
-		dest.height = xtext->fontsize;
-
-		if (gdk_rectangle_intersect (&clip, &dest, &dest))
-			/* dump the DB to window, but only within the clip_x/x2/y/y2 */
-			gdk_draw_drawable (xtext->draw_buf, xtext->bgc, pix,
-									 dest.x - dest_x, dest.y - dest_y,
-									 dest.x, dest.y, dest.width, dest.height);
-		g_object_unref (pix);
+		backend_draw_text_emph (xtext, dofill, gc, x, y, str, len, str_width, *emphasis);
+		cairo_restore (xtext->cr);
+		xtext_invalidate (xtext, dest.x, dest.y, dest.width, dest.height);
 	}
 
 	if (xtext->strikethrough)
 	{
 		/* pango_attr_strikethrough_new does not render in the custom widget so we need to reinvent the wheel */
 		y = dest_y + (xtext->fontsize / 2);
-		gdk_draw_line (xtext->draw_buf, gc, dest_x, y, dest_x + str_width - 1, y);
+		xtext_draw_line (xtext, gc, dest_x, y, dest_x + str_width - 1, y);
 	}
 
 	if (xtext->underline)
 	{
 dounder:
-
-		if (pix)
-			y = dest_y + xtext->font->ascent + 1;
-		else
-		{
-			y++;
-			dest_x = x;
-		}
-		/* draw directly to window, it's out of the range of our DB */
-		gdk_draw_line (xtext->draw_buf, gc, dest_x, y, dest_x + str_width - 1, y);
+		y++;
+		xtext_draw_line (xtext, gc, x, y, x + str_width - 1, y);
 	}
 
 	return str_width;
@@ -2668,9 +2709,9 @@ gtk_xtext_reset (GtkXText * xtext, int mark, int attribs)
 	{
 		xtext->backcolor = FALSE;
 		if (xtext->col_fore != XTEXT_FG)
-			xtext_set_fg (xtext, xtext->fgc, XTEXT_FG);
+			xtext_set_fg (xtext, &xtext->fgc, XTEXT_FG);
 		if (xtext->col_back != XTEXT_BG)
-			xtext_set_bg (xtext, xtext->fgc, XTEXT_BG);
+			xtext_set_bg (xtext, &xtext->fgc, XTEXT_BG);
 	}
 	xtext->col_fore = XTEXT_FG;
 	xtext->col_back = XTEXT_BG;
@@ -2745,7 +2786,7 @@ gtk_xtext_render_str (GtkXText * xtext, int y, textentry * ent,
 							 unsigned char *str, int len, int win_width, int indent,
 							 int line, int left_only, int *x_size_ret, int *emphasis)
 {
-	GdkGC *gc;
+	xtext_gc *gc;
 	int i = 0, x = indent, j = 0;
 	unsigned char *pstr = str;
 	int col_num, tmp;
@@ -2760,7 +2801,7 @@ gtk_xtext_render_str (GtkXText * xtext, int y, textentry * ent,
 
 	offset = str - ent->str;
 
-	gc = xtext->fgc;				  /* our foreground GC */
+	gc = &xtext->fgc;				  /* our foreground GC */
 
 	if (ent->mark_start != -1 &&
 		 ent->mark_start <= i + offset && ent->mark_end > i + offset)
@@ -3442,11 +3483,11 @@ gtk_xtext_set_palette (GtkXText * xtext, GdkColor palette[])
 
 	if (gtk_widget_get_realized (GTK_WIDGET(xtext)))
 	{
-		xtext_set_fg (xtext, xtext->fgc, XTEXT_FG);
-		xtext_set_bg (xtext, xtext->fgc, XTEXT_BG);
-		xtext_set_fg (xtext, xtext->bgc, XTEXT_BG);
+		xtext_set_fg (xtext, &xtext->fgc, XTEXT_FG);
+		xtext_set_bg (xtext, &xtext->fgc, XTEXT_BG);
+		xtext_set_fg (xtext, &xtext->bgc, XTEXT_BG);
 
-		gdk_gc_set_foreground (xtext->marker_gc, &xtext->palette[XTEXT_MARKER]);
+		xtext_set_fg (xtext, &xtext->marker_gc, XTEXT_MARKER);
 	}
 	xtext->col_fore = XTEXT_FG;
 	xtext->col_back = XTEXT_BG;
@@ -3530,37 +3571,20 @@ gtk_xtext_set_font (GtkXText *xtext, char *name)
 }
 
 void
-gtk_xtext_set_background (GtkXText * xtext, GdkPixmap * pixmap)
+gtk_xtext_set_background (GtkXText * xtext, cairo_surface_t *pixmap)
 {
-	GdkGCValues val;
-
 	if (xtext->pixmap)
 	{
-		g_object_unref (xtext->pixmap);
+		cairo_surface_destroy (xtext->pixmap);
 		xtext->pixmap = NULL;
 	}
 
 	dontscroll (xtext->buffer);
-	xtext->pixmap = pixmap;
 
-	if (pixmap != 0)
+	if (pixmap != NULL)
 	{
-		g_object_ref (pixmap);
-		if (gtk_widget_get_realized (GTK_WIDGET(xtext)))
-		{
-			gdk_gc_set_tile (xtext->bgc, pixmap);
-			gdk_gc_set_ts_origin (xtext->bgc, 0, 0);
-			xtext->ts_x = xtext->ts_y = 0;
-			gdk_gc_set_fill (xtext->bgc, GDK_TILED);
-		}
-	} else if (gtk_widget_get_realized (GTK_WIDGET(xtext)))
-	{
-		g_object_unref (xtext->bgc);
-		val.subwindow_mode = GDK_INCLUDE_INFERIORS;
-		val.graphics_exposures = 0;
-		xtext->bgc = gdk_gc_new_with_values (GTK_WIDGET (xtext)->window,
-								&val, GDK_GC_EXPOSURES | GDK_GC_SUBWINDOW);
-		xtext_set_fg (xtext, xtext->bgc, XTEXT_BG);
+		xtext->pixmap = cairo_surface_reference (pixmap);
+		xtext->ts_x = xtext->ts_y = 0;
 	}
 }
 
@@ -3617,7 +3641,7 @@ gtk_xtext_lines_taken (xtext_buffer *buf, textentry * ent)
 	return g_slist_length (ent->sublines);
 }
 
-/* Calculate number of actual lines (with wraps), to set adj->lower. *
+/* Calculate number of actual lines (with wraps), to set gtk_adjustment_get_lower (adj). *
  * This should only be called when the window resizes.               */
 
 static void
@@ -3803,7 +3827,7 @@ gtk_xtext_render_page (GtkXText * xtext)
 	int width;
 	int height;
 	int subline;
-	int startline = xtext->adj->value;
+	int startline = gtk_adjustment_get_value (xtext->adj);
 	int pos, overlap;
 
 	if(!gtk_widget_get_realized(GTK_WIDGET(xtext)))
@@ -3812,12 +3836,13 @@ gtk_xtext_render_page (GtkXText * xtext)
 	if (xtext->buffer->indent < MARGIN)
 		xtext->buffer->indent = MARGIN;	  /* 2 pixels is our left margin */
 
-	gdk_drawable_get_size (GTK_WIDGET (xtext)->window, &width, &height);
+	width = gtk_widget_get_allocated_width (GTK_WIDGET (xtext));
+	height = gtk_widget_get_allocated_height (GTK_WIDGET (xtext));
 
 	if (width < 34 || height < xtext->fontsize || width < xtext->buffer->indent + 32)
 		return;
 
-	xtext->pixel_offset = (xtext->adj->value - startline) * xtext->fontsize;
+	xtext->pixel_offset = (gtk_adjustment_get_value (xtext->adj) - startline) * xtext->fontsize;
 
 	subline = line = 0;
 	ent = xtext->buffer->text_first;
@@ -3829,10 +3854,10 @@ gtk_xtext_render_page (GtkXText * xtext)
 	xtext->buffer->pagetop_subline = subline;
 	xtext->buffer->pagetop_line = startline;
 
-	if (xtext->buffer->num_lines <= xtext->adj->page_size)
+	if (xtext->buffer->num_lines <= gtk_adjustment_get_page_size (xtext->adj))
 		dontscroll (xtext->buffer);
 
-	pos = xtext->adj->value * xtext->fontsize;
+	pos = gtk_adjustment_get_value (xtext->adj) * xtext->fontsize;
 	overlap = xtext->buffer->last_pixel_pos - pos;
 	xtext->buffer->last_pixel_pos = pos;
 
@@ -3841,26 +3866,21 @@ gtk_xtext_render_page (GtkXText * xtext)
 	{
 		GdkRectangle area;
 
-		/* so the obscured regions are exposed */
-		gdk_gc_set_exposures (xtext->fgc, TRUE);
 		if (overlap < 1)	/* DOWN */
 		{
 			int remainder;
 
-			gdk_draw_drawable (xtext->draw_buf, xtext->fgc, xtext->draw_buf,
-									 0, -overlap, 0, 0, width, height + overlap);
+			xtext_scroll_surface (xtext, 0, -overlap, 0, 0, width, height + overlap);
 			remainder = ((height - xtext->font->descent) % xtext->fontsize) +
 							xtext->font->descent;
 			area.y = (height + overlap) - remainder;
 			area.height = remainder - overlap;
 		} else
 		{
-			gdk_draw_drawable (xtext->draw_buf, xtext->fgc, xtext->draw_buf,
-									 0, 0, 0, overlap, width, height - overlap);
+			xtext_scroll_surface (xtext, 0, 0, 0, overlap, width, height - overlap);
 			area.y = 0;
 			area.height = overlap;
 		}
-		gdk_gc_set_exposures (xtext->fgc, FALSE);
 
 		if (area.height > 0)
 		{
@@ -3972,7 +3992,7 @@ gtk_xtext_remove_top (xtext_buffer *buffer)
 	buffer->old_value -= g_slist_length (ent->sublines);
 	if (buffer->xtext->buffer == buffer)	/* is it the current buffer? */
 	{
-		buffer->xtext->adj->value -= g_slist_length (ent->sublines);
+		xtext_adj_set_value_quiet (buffer->xtext, gtk_adjustment_get_value (buffer->xtext->adj) - g_slist_length (ent->sublines));
 		buffer->xtext->select_start_adj -= g_slist_length (ent->sublines);
 	}
 
@@ -4514,13 +4534,13 @@ gtk_xtext_search (GtkXText * xtext, const gchar *text, gtk_xtext_search_flags fl
 		{
 			value += g_slist_length (ent->sublines);
 		}
-		if (value > adj->upper - adj->page_size)
+		if (value > gtk_adjustment_get_upper (adj) - gtk_adjustment_get_page_size (adj))
 		{
-			value = adj->upper - adj->page_size;
+			value = gtk_adjustment_get_upper (adj) - gtk_adjustment_get_page_size (adj);
 		}
 		else if ((flags & backward)  && ent)
 		{
-			value -= adj->page_size - g_slist_length (ent->sublines);
+			value -= gtk_adjustment_get_page_size (adj) - g_slist_length (ent->sublines);
 			if (value < 0)
 			{
 				value = 0;
@@ -4545,18 +4565,18 @@ gtk_xtext_render_page_timeout (GtkXText * xtext)
 	xtext->add_io_tag = 0;
 
 	/* less than a complete page? */
-	if (xtext->buffer->num_lines <= adj->page_size)
+	if (xtext->buffer->num_lines <= gtk_adjustment_get_page_size (adj))
 	{
 		xtext->buffer->old_value = 0;
-		adj->value = 0;
+		xtext_adj_set_value_quiet (xtext, 0);
 		gtk_xtext_render_page (xtext);
 	} else if (xtext->buffer->scrollbar_down)
 	{
 		g_signal_handler_block (xtext->adj, xtext->vc_signal_tag);
 		gtk_xtext_adjustment_set (xtext->buffer, FALSE);
-		gtk_adjustment_set_value (adj, adj->upper - adj->page_size);
+		gtk_adjustment_set_value (adj, gtk_adjustment_get_upper (adj) - gtk_adjustment_get_page_size (adj));
 		g_signal_handler_unblock (xtext->adj, xtext->vc_signal_tag);
-		xtext->buffer->old_value = adj->value;
+		xtext->buffer->old_value = gtk_adjustment_get_value (adj);
 		gtk_xtext_render_page (xtext);
 	} else
 	{
@@ -4628,7 +4648,7 @@ gtk_xtext_append_entry (xtext_buffer *buf, textentry * ent, time_t stamp)
 	if (buf->xtext->buffer == buf)
 	{
 		/* this could be improved */
-		if ((buf->num_lines - 1) <= buf->xtext->adj->page_size)
+		if ((buf->num_lines - 1) <= gtk_adjustment_get_page_size (buf->xtext->adj))
 			dontscroll (buf);
 
 		if (!buf->xtext->add_io_tag)
@@ -4647,7 +4667,7 @@ gtk_xtext_append_entry (xtext_buffer *buf, textentry * ent, time_t stamp)
 	}
 	if (buf->scrollbar_down)
 	{
-		buf->old_value = buf->num_lines - buf->xtext->adj->page_size;
+		buf->old_value = buf->num_lines - gtk_adjustment_get_page_size (buf->xtext->adj);
 		if (buf->old_value < 0)
 			buf->old_value = 0;
 	}
@@ -4929,13 +4949,13 @@ gtk_xtext_moveto_marker_pos (GtkXText *xtext)
 			value += g_slist_length (ent->sublines);
 			ent = ent->next;
 		}
-		if (value >= adj->value && value < adj->value + adj->page_size)
+		if (value >= gtk_adjustment_get_value (adj) && value < gtk_adjustment_get_value (adj) + gtk_adjustment_get_page_size (adj))
 			return MARKER_IS_SET;
-		value -= adj->page_size / 2;
+		value -= gtk_adjustment_get_page_size (adj) / 2;
 		if (value < 0)
 			value = 0;
-		if (value > adj->upper - adj->page_size)
-			value = adj->upper - adj->page_size;
+		if (value > gtk_adjustment_get_upper (adj) - gtk_adjustment_get_page_size (adj))
+			value = gtk_adjustment_get_upper (adj) - gtk_adjustment_get_page_size (adj);
 		gtk_adjustment_set_value (adj, value);
 		gtk_xtext_render_page (xtext);
 	}
@@ -4988,25 +5008,25 @@ gtk_xtext_buffer_show (GtkXText *xtext, xtext_buffer *buf, int render)
 	/* now change to the new buffer */
 	xtext->buffer = buf;
 	dontscroll (buf);	/* force scrolling off */
-	xtext->adj->value = buf->old_value;
-	xtext->adj->upper = buf->num_lines;
+	gtk_adjustment_set_upper (xtext->adj, buf->num_lines);
+	xtext_adj_set_value_quiet (xtext, buf->old_value);
 
 	/* if the scrollbar was down, keep it down */
-	if (xtext->buffer->scrollbar_down && xtext->adj->value <
-		xtext->adj->upper - xtext->adj->page_size)
+	if (xtext->buffer->scrollbar_down && gtk_adjustment_get_value (xtext->adj) <
+		gtk_adjustment_get_upper (xtext->adj) - gtk_adjustment_get_page_size (xtext->adj))
 	{
-		xtext->adj->value = xtext->adj->upper - xtext->adj->page_size;
+		xtext_adj_set_value_quiet (xtext, gtk_adjustment_get_upper (xtext->adj) - gtk_adjustment_get_page_size (xtext->adj));
 	}
 
-	if (xtext->adj->upper == 0)
-		xtext->adj->upper = 1;
+	if (gtk_adjustment_get_upper (xtext->adj) == 0)
+		gtk_adjustment_set_upper (xtext->adj, 1);
 	/* sanity check */
-	else if (xtext->adj->value > xtext->adj->upper - xtext->adj->page_size)
+	else if (gtk_adjustment_get_value (xtext->adj) > gtk_adjustment_get_upper (xtext->adj) - gtk_adjustment_get_page_size (xtext->adj))
 	{
 		/*buf->pagetop_ent = NULL;*/
-		xtext->adj->value = xtext->adj->upper - xtext->adj->page_size;
-		if (xtext->adj->value < 0)
-			xtext->adj->value = 0;
+		xtext_adj_set_value_quiet (xtext, gtk_adjustment_get_upper (xtext->adj) - gtk_adjustment_get_page_size (xtext->adj));
+		if (gtk_adjustment_get_value (xtext->adj) < 0)
+			xtext_adj_set_value_quiet (xtext, 0);
 	}
 
 	if (render)
@@ -5018,14 +5038,14 @@ gtk_xtext_buffer_show (GtkXText *xtext, xtext_buffer *buf, int render)
 			buf->window_height = h;
 			gtk_xtext_calc_lines (buf, FALSE);
 			if (buf->scrollbar_down)
-				gtk_adjustment_set_value (xtext->adj, xtext->adj->upper -
-												  xtext->adj->page_size);
+				gtk_adjustment_set_value (xtext->adj, gtk_adjustment_get_upper (xtext->adj) -
+												  gtk_adjustment_get_page_size (xtext->adj));
 		} else if (buf->window_height != h)
 		{
 			buf->window_height = h;
 			buf->pagetop_ent = NULL;
 			if (buf->scrollbar_down)
-				xtext->adj->value = xtext->adj->upper;
+				xtext_adj_set_value_quiet (xtext, gtk_adjustment_get_upper (xtext->adj));
 			gtk_xtext_adjustment_set (buf, FALSE);
 		}
 

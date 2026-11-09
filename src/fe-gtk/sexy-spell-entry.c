@@ -92,14 +92,16 @@ struct _SexySpellEntryPriv
 	gint                 *word_ends;
 	gboolean              checked;
 	gboolean              parseattr;
+	gint                  preedit_length;	/* bytes of IME preedit text in the layout */
 };
 
 static void sexy_spell_entry_class_init(SexySpellEntryClass *klass);
-static void sexy_spell_entry_editable_init (GtkEditableClass *iface);
+static void sexy_spell_entry_editable_init (GtkEditableInterface *iface);
+static void sexy_spell_entry_preedit_changed(GtkEntry *gtk_entry, const gchar *preedit, gpointer data);
 static void sexy_spell_entry_init(SexySpellEntry *entry);
 static void sexy_spell_entry_finalize(GObject *obj);
 static void sexy_spell_entry_destroy(GObject *obj);
-static gint sexy_spell_entry_expose(GtkWidget *widget, GdkEventExpose *event);
+static gboolean sexy_spell_entry_draw(GtkWidget *widget, cairo_t *cr);
 static gint sexy_spell_entry_button_press(GtkWidget *widget, GdkEventButton *event);
 
 /* GtkEditable handlers */
@@ -243,7 +245,7 @@ sexy_spell_entry_class_init(SexySpellEntryClass *klass)
 
 	object_class->dispose = sexy_spell_entry_destroy;
 
-	widget_class->expose_event = sexy_spell_entry_expose;
+	widget_class->draw = sexy_spell_entry_draw;
 	widget_class->button_press_event = sexy_spell_entry_button_press;
 
 	/**
@@ -275,7 +277,7 @@ sexy_spell_entry_class_init(SexySpellEntryClass *klass)
 }
 
 static void
-sexy_spell_entry_editable_init (GtkEditableClass *iface)
+sexy_spell_entry_editable_init (GtkEditableInterface *iface)
 {
 }
 
@@ -288,20 +290,24 @@ gtk_entry_find_position (GtkEntry *entry, gint x)
 	gint cursor_index;
 	gint index;
 	gint pos;
+	gint preedit_length = SEXY_SPELL_ENTRY(entry)->priv->preedit_length;
+	gint layout_x;
 	gboolean trailing;
 
-	x = x + entry->scroll_offset;
+	/* x is in widget coordinates, this takes scrolling and borders into account */
+	gtk_entry_get_layout_offsets(entry, &layout_x, NULL);
+	x = x - layout_x;
 
 	layout = gtk_entry_get_layout(entry);
 	text = pango_layout_get_text(layout);
-	cursor_index = g_utf8_offset_to_pointer(text, entry->current_pos) - text;
+	cursor_index = g_utf8_offset_to_pointer(text, gtk_editable_get_position(GTK_EDITABLE(entry))) - text;
 
 	line = pango_layout_get_lines(layout)->data;
 	pango_layout_line_x_to_index(line, x * PANGO_SCALE, &index, &trailing);
 
-	if (index >= cursor_index && entry->preedit_length) {
-		if (index >= cursor_index + entry->preedit_length) {
-			index -= entry->preedit_length;
+	if (index >= cursor_index && preedit_length) {
+		if (index >= cursor_index + preedit_length) {
+			index -= preedit_length;
 		} else {
 			index = cursor_index;
 			trailing = FALSE;
@@ -783,6 +789,7 @@ sexy_spell_entry_init(SexySpellEntry *entry)
 	g_signal_connect(G_OBJECT(entry), "popup-menu", G_CALLBACK(sexy_spell_entry_popup_menu), entry);
 	g_signal_connect(G_OBJECT(entry), "populate-popup", G_CALLBACK(sexy_spell_entry_populate_popup), NULL);
 	g_signal_connect(G_OBJECT(entry), "changed", G_CALLBACK(sexy_spell_entry_changed), NULL);
+	g_signal_connect(G_OBJECT(entry), "preedit-changed", G_CALLBACK(sexy_spell_entry_preedit_changed), NULL);
 }
 
 static void
@@ -1115,8 +1122,16 @@ sexy_spell_entry_recheck_all(SexySpellEntry *entry)
 	}
 }
 
-static gint
-sexy_spell_entry_expose(GtkWidget *widget, GdkEventExpose *event)
+static void
+sexy_spell_entry_preedit_changed(GtkEntry *gtk_entry, const gchar *preedit, gpointer data)
+{
+	SexySpellEntry *entry = SEXY_SPELL_ENTRY(gtk_entry);
+
+	entry->priv->preedit_length = strlen(preedit);
+}
+
+static gboolean
+sexy_spell_entry_draw(GtkWidget *widget, cairo_t *cr)
 {
 	SexySpellEntry *entry = SEXY_SPELL_ENTRY(widget);
 	GtkEntry *gtk_entry = GTK_ENTRY(widget);
@@ -1124,7 +1139,7 @@ sexy_spell_entry_expose(GtkWidget *widget, GdkEventExpose *event)
 
 	
 	layout = gtk_entry_get_layout(gtk_entry);
-	if (gtk_entry->preedit_length == 0)
+	if (entry->priv->preedit_length == 0)
 	{
 		pango_layout_set_attributes(layout, entry->priv->attr_list);
 	}
@@ -1133,7 +1148,7 @@ sexy_spell_entry_expose(GtkWidget *widget, GdkEventExpose *event)
 		pango_layout_set_attributes(layout, empty_attrs_list);
 	}
 
-	return GTK_WIDGET_CLASS(parent_class)->expose_event (widget, event);
+	return GTK_WIDGET_CLASS(parent_class)->draw (widget, cr);
 }
 
 static gint
@@ -1143,7 +1158,15 @@ sexy_spell_entry_button_press(GtkWidget *widget, GdkEventButton *event)
 	GtkEntry *gtk_entry = GTK_ENTRY(widget);
 	gint pos;
 
-	pos = gtk_entry_find_position(gtk_entry, event->x);
+	/* event coordinates are relative to the entry's event window, find_position wants widget coordinates */
+	{
+		GtkAllocation allocation;
+		gint origin_x = 0;
+
+		gtk_widget_get_allocation(widget, &allocation);
+		gdk_window_get_origin(gtk_widget_get_window(widget), &origin_x, NULL);
+		pos = gtk_entry_find_position(gtk_entry, (gint)event->x_root - origin_x - allocation.x);
+	}
 	entry->priv->mark_character = pos;
 
 	return GTK_WIDGET_CLASS(parent_class)->button_press_event (widget, event);

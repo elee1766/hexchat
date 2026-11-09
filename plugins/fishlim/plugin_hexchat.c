@@ -453,14 +453,14 @@ static int handle_keyx_notice(char *word[], char *word_eol[], void *userdata) {
     if (dh1080_compute_key(priv_key, dh_pubkey, &secret_key)) {
         keystore_store_key(sender, secret_key, mode);
         hexchat_printf(ph, "Stored new key for %s (%s)", sender, fish_modes[mode]);
-        g_free(secret_key);
+        dh1080_free_secret(secret_key);
     } else {
         hexchat_print(ph, "Failed to create secret key!");
     }
 
 cleanup:
     g_free(sender);
-    g_free(priv_key);
+    dh1080_free_secret(priv_key);
     return HEXCHAT_EAT_ALL;
 }
 
@@ -821,7 +821,7 @@ int hexchat_plugin_init(hexchat_plugin *plugin_handle,
     if (!dh1080_init())
         return 0;
 
-    pending_exchanges = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    pending_exchanges = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, dh1080_free_secret);
 
     hexchat_printf(ph, "%s plugin loaded\n", plugin_name);
     /* Return success */

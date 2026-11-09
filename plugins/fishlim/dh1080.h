@@ -21,4 +21,5 @@ int dh1080_generate_key (char **, char **);
 int dh1080_compute_key (const char *, const char *, char **);
 int dh1080_init (void);
 void dh1080_deinit (void);
+void dh1080_free_secret (void *);   /* cleanse + free a private/secret key string */
 
