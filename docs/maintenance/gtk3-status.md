@@ -5,9 +5,9 @@ Branch `cog/gtk3-modernization`, based on HexChat 2.16.2 (`master` @ b544ac33).
 ## Reference environment
 
 A Debian 13 (trixie) container. `.github/workflows/debian13-gtk3.yml` lists the
-exact packages and steps. All results below come from that environment
-(OpenSSL 3.5, GTK 3.24, Xvfb + openbox). Nothing was run on GitHub Actions,
-Windows, macOS, Flatpak or Wayland.
+exact packages and steps. All local results below come from that environment
+(OpenSSL 3.5, GTK 3.24, Xvfb + openbox). GitHub Actions results are listed below.
+Windows, macOS, Flatpak and Wayland were not tested.
 
 ## Verification commands
 
@@ -141,5 +141,17 @@ Run in the Debian 13 container after the final edits (rebuilt with `ninja`, no e
   an overlapping run was still using the same X display (`:97`); a clean rerun
   passed. Do not run two instances at once.
 - `git diff --check`: clean.
-- Not run: GitHub workflows, a clean-tree configure with the final `meson.build`
-  on a second machine, and any non-Debian platform.
+- GitHub Actions run 42551913547 (PR #1): build, all Meson tests and the TLS
+  integration test passed; the GUI test passed 29 of 30. The failure was the
+  strict "no GTK/GLib warnings" check: `Gtk-WARNING: Could not load a pixbuf
+  from /org/gtk/libgtk/theme/Adwaita/assets/check-symbolic.svg`. Cause: the
+  workflow installs with `--no-install-recommends`, which omits the SVG
+  gdk-pixbuf loader. Fix: the workflow now installs `librsvg2-common` (the
+  package that ships the loader in Debian 13). Reproduced in a `debian:13`
+  container: without the package the same single check fails with the same
+  warning; with it, `ci/gui-test.sh build` reports 0 failures. The warning
+  assertion is unchanged and unfiltered. The fixed workflow has not yet been
+  run on GitHub Actions.
+- The workflow also uses `actions/checkout@v6` (Node 24 runtime, tag verified).
+- Not run: a clean-tree configure with the final `meson.build` on a second
+  machine, and any non-Debian platform.
