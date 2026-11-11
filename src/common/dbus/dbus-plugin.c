@@ -19,11 +19,9 @@
  * xclaesse@gmail.com
  */
 
-#define DBUS_API_SUBJECT_TO_CHANGE
 
 #include <config.h>
-#include <dbus/dbus-glib.h>
-#include <dbus/dbus-glib-lowlevel.h>
+#include <gio/gio.h>
 #include <glib/gi18n.h>
 #include "hexchat-plugin.h"
 #include "dbus-plugin.h"
@@ -38,7 +36,7 @@ static hexchat_plugin *ph;
 static guint last_context_id = 0;
 static GList *contexts = NULL;
 static GHashTable *clients = NULL;
-static DBusGConnection *connection;
+static GDBusConnection *connection;
 
 typedef struct RemoteObject RemoteObject;
 typedef struct RemoteObjectClass RemoteObjectClass;
@@ -53,6 +51,7 @@ struct RemoteObject
 	guint last_list_id;
 	hexchat_context *context;
 	char *dbus_path;
+	guint registrations[2];
 	char *filename;
 	GHashTable *hooks;
 	GHashTable *lists;
@@ -78,16 +77,6 @@ typedef struct
 	hexchat_context *context;
 } ContextInfo;
 
-enum
-{
-	SERVER_SIGNAL,
-	COMMAND_SIGNAL,
-	PRINT_SIGNAL,
-	UNLOAD_SIGNAL,
-	LAST_SIGNAL
-};
-
-static guint signals[LAST_SIGNAL] = { 0 };
 
 #define REMOTE_TYPE_OBJECT              (remote_object_get_type ())
 #define REMOTE_OBJECT(object)           (G_TYPE_CHECK_INSTANCE_CAST ((object), REMOTE_TYPE_OBJECT, RemoteObject))
@@ -107,10 +96,10 @@ static gboolean		remote_object_connect		(RemoteObject *obj,
 							 const char *name,
 							 const char *desc,
 							 const char *version,
-							 DBusGMethodInvocation *context);
+							 GDBusMethodInvocation *context);
 
 static gboolean		remote_object_disconnect	(RemoteObject *obj,
-							 DBusGMethodInvocation *context);
+							 GDBusMethodInvocation *context);
 
 static gboolean		remote_object_command		(RemoteObject *obj,
 							 const char *command,
@@ -240,8 +229,9 @@ static gboolean		remote_object_send_modes	(RemoteObject *obj,
 							 char mode,
 							 GError **error);
 
-#include "remote-object-glue.h"
-#include "../marshal.h"
+#include "remote-object-xml.h"
+
+static gboolean register_remote (RemoteObject *obj, GError **error);
 
 /* Useful functions */
 
@@ -273,12 +263,17 @@ static void
 remote_object_finalize (GObject *obj)
 {
 	RemoteObject *self = (RemoteObject*)obj;
+	guint i;
 
+	for (i = 0; i < G_N_ELEMENTS (self->registrations); i++)
+		if (self->registrations[i])
+			g_dbus_connection_unregister_object (connection, self->registrations[i]);
 	g_hash_table_destroy (self->lists);
 	g_hash_table_destroy (self->hooks);
 	g_free (self->dbus_path);
 	g_free (self->filename);
-	hexchat_plugingui_remove (ph, self->handle);
+	if (self->handle)
+		hexchat_plugingui_remove (ph, self->handle);
 
 	G_OBJECT_CLASS (remote_object_parent_class)->finalize (obj);
 }
@@ -311,45 +306,7 @@ remote_object_class_init (RemoteObjectClass *klass)
 
 	gobject_class->finalize = remote_object_finalize;
 
-	signals[SERVER_SIGNAL] =
-		g_signal_new ("server_signal",
-			      G_OBJECT_CLASS_TYPE (klass),
-			      G_SIGNAL_RUN_LAST,
-			      0,
-			      NULL, NULL,
-			      _hexchat_marshal_VOID__POINTER_POINTER_UINT_UINT,
-			      G_TYPE_NONE,
-			      4, G_TYPE_STRV, G_TYPE_STRV, G_TYPE_UINT, G_TYPE_UINT);
 
-	signals[COMMAND_SIGNAL] =
-		g_signal_new ("command_signal",
-			      G_OBJECT_CLASS_TYPE (klass),
-			      G_SIGNAL_RUN_LAST,
-			      0,
-			      NULL, NULL,
-			      _hexchat_marshal_VOID__POINTER_POINTER_UINT_UINT,
-			      G_TYPE_NONE,
-			      4, G_TYPE_STRV, G_TYPE_STRV, G_TYPE_UINT, G_TYPE_UINT);
-
-	signals[PRINT_SIGNAL] =
-		g_signal_new ("print_signal",
-			      G_OBJECT_CLASS_TYPE (klass),
-			      G_SIGNAL_RUN_LAST,
-			      0,
-			      NULL, NULL,
-			      _hexchat_marshal_VOID__POINTER_POINTER_UINT_UINT,
-			      G_TYPE_NONE,
-			      3, G_TYPE_STRV, G_TYPE_UINT, G_TYPE_UINT);
-
-	signals[UNLOAD_SIGNAL] =
-		g_signal_new ("unload_signal",
-			      G_OBJECT_CLASS_TYPE (klass),
-			      G_SIGNAL_RUN_LAST,
-			      0,
-			      NULL, NULL,
-			      g_cclosure_marshal_VOID__VOID,
-			      G_TYPE_NONE,
-			      0);
 }
 
 /* Implementation of services */
@@ -360,17 +317,17 @@ remote_object_connect (RemoteObject *obj,
 		       const char *name,
 		       const char *desc,
 		       const char *version,
-		       DBusGMethodInvocation *context)
+		       GDBusMethodInvocation *context)
 {
 	static guint count = 0;
 	char *sender, *path;
 	RemoteObject *remote_object;
 	gchar count_buffer[15];
 	
-	sender = dbus_g_method_get_sender (context);
+	sender = g_strdup (g_dbus_method_invocation_get_sender (context));
 	remote_object = g_hash_table_lookup (clients, sender);
 	if (remote_object != NULL) {
-		dbus_g_method_return (context, remote_object->dbus_path);
+		g_dbus_method_invocation_return_value (context, g_variant_new ("(s)", remote_object->dbus_path));
 		g_free (sender);
 		return TRUE;
 	}
@@ -384,29 +341,33 @@ remote_object_connect (RemoteObject *obj,
 						     name,
 						     desc,
 						     version, NULL);
-	dbus_g_connection_register_g_object (connection,
-					     path,
-					     G_OBJECT (remote_object));
+	if (!register_remote (remote_object, NULL))
+	{
+		g_object_unref (remote_object);
+		g_free (sender);
+		g_dbus_method_invocation_return_error (context, G_IO_ERROR, G_IO_ERROR_FAILED, "Could not register client");
+		return TRUE;
+	}
 
 	g_hash_table_insert (clients,
 			     sender,
 			     remote_object);
 
-	dbus_g_method_return (context, path);
+	g_dbus_method_invocation_return_value (context, g_variant_new ("(s)", path));
 	return TRUE;
 }
 
 static gboolean
 remote_object_disconnect (RemoteObject *obj,
-			  DBusGMethodInvocation *context)
+			  GDBusMethodInvocation *context)
 {
 	char *sender;
 	
-	sender = dbus_g_method_get_sender (context);
+	sender = g_strdup (g_dbus_method_invocation_get_sender (context));
 	g_hash_table_remove (clients, sender);
 	g_free (sender);
 
-	dbus_g_method_return (context);
+	g_dbus_method_invocation_return_value (context, NULL);
 	return TRUE;
 }
 
@@ -506,7 +467,7 @@ remote_object_get_prefs (RemoteObject *obj,
 			 int *ret_int,
 			 GError **error)
 {
-	const char *str;
+	const char *str = NULL;
 
 	if (!hexchat_set_context (ph, obj->context)) {
 		*ret_type = 0;
@@ -530,11 +491,10 @@ server_hook_cb (char *word[],
 	arg1 = build_list (word + 1);
 	arg2 = build_list (word_eol + 1);
 	info->obj->context = hexchat_get_context (ph);
-	g_signal_emit (info->obj,
-		       signals[SERVER_SIGNAL],
-		       0,
-		       arg1, arg2, info->id,
-		       context_list_find_id (info->obj->context));
+	g_dbus_connection_emit_signal (connection, NULL, info->obj->dbus_path,
+		"org.hexchat.plugin", "ServerSignal",
+		g_variant_new ("(^as^asuu)", arg1, arg2, info->id,
+		context_list_find_id (info->obj->context)), NULL);
 	g_strfreev (arg1);
 	g_strfreev (arg2);
   
@@ -553,11 +513,10 @@ command_hook_cb (char *word[],
 	arg1 = build_list (word + 1);
 	arg2 = build_list (word_eol + 1);
 	info->obj->context = hexchat_get_context (ph);
-	g_signal_emit (info->obj,
-		       signals[COMMAND_SIGNAL],
-		       0,
-		       arg1, arg2, info->id,
-		       context_list_find_id (info->obj->context));
+	g_dbus_connection_emit_signal (connection, NULL, info->obj->dbus_path,
+		"org.hexchat.plugin", "CommandSignal",
+		g_variant_new ("(^as^asuu)", arg1, arg2, info->id,
+		context_list_find_id (info->obj->context)), NULL);
 	g_strfreev (arg1);
 	g_strfreev (arg2);
   
@@ -573,11 +532,10 @@ print_hook_cb (char *word[],
 
 	arg1 = build_list (word + 1);
 	info->obj->context = hexchat_get_context (ph);
-	g_signal_emit (info->obj,
-		       signals[PRINT_SIGNAL],
-		       0,
-		       arg1, info->id,
-		       context_list_find_id (info->obj->context));
+	g_dbus_connection_emit_signal (connection, NULL, info->obj->dbus_path,
+		"org.hexchat.plugin", "PrintSignal",
+		g_variant_new ("(^asuu)", arg1, info->id,
+		context_list_find_id (info->obj->context)), NULL);
 	g_strfreev (arg1);
   
 	return info->return_value;
@@ -868,74 +826,335 @@ remote_object_send_modes (RemoteObject *obj,
 	return TRUE;
 }
 
-/* DBUS stuffs */
+static void
+method_call (GDBusConnection *bus, const char *sender, const char *path,
+             const char *interface, const char *method, GVariant *parameters,
+             GDBusMethodInvocation *invocation, gpointer user_data)
+{
+	RemoteObject *obj = g_object_ref (user_data);
+	if (g_str_equal (interface, "org.hexchat.connection") && g_str_equal (method, "Connect")) {
+		char *filename = NULL;
+		char *name = NULL;
+		char *desc = NULL;
+		char *version = NULL;
+		g_variant_get (parameters, "(ssss)", &filename, &name, &desc, &version);
+		remote_object_connect (obj, filename, name, desc, version, invocation);
+		g_free (filename);
+		g_free (name);
+		g_free (desc);
+		g_free (version);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.connection") && g_str_equal (method, "Disconnect")) {
+		remote_object_disconnect (obj, invocation);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "Command")) {
+		char *command = NULL;
+		g_variant_get (parameters, "(s)", &command);
+		remote_object_command (obj, command, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("()"));
+		g_free (command);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "Print")) {
+		char *text = NULL;
+		g_variant_get (parameters, "(s)", &text);
+		remote_object_print (obj, text, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("()"));
+		g_free (text);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "FindContext")) {
+		char *server = NULL;
+		char *channel = NULL;
+		guint ret_id = 0;
+		g_variant_get (parameters, "(ss)", &server, &channel);
+		remote_object_find_context (obj, server, channel, &ret_id, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", ret_id));
+		g_free (server);
+		g_free (channel);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "GetContext")) {
+		guint ret_id = 0;
+		remote_object_get_context (obj, &ret_id, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", ret_id));
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "SetContext")) {
+		guint id = 0;
+		gboolean ret = 0;
+		g_variant_get (parameters, "(u)", &id);
+		remote_object_set_context (obj, id, &ret, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(b)", ret));
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "GetInfo")) {
+		char *id = NULL;
+		char *ret_info = NULL;
+		g_variant_get (parameters, "(s)", &id);
+		remote_object_get_info (obj, id, &ret_info, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(s)", ret_info ? ret_info : ""));
+		g_free (id);
+		g_free (ret_info);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "GetPrefs")) {
+		char *name = NULL;
+		gint ret_type = 0;
+		char *ret_str = NULL;
+		gint ret_int = 0;
+		g_variant_get (parameters, "(s)", &name);
+		remote_object_get_prefs (obj, name, &ret_type, &ret_str, &ret_int, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(isi)", ret_type, ret_str ? ret_str : "", ret_int));
+		g_free (name);
+		g_free (ret_str);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "HookCommand")) {
+		char *name = NULL;
+		gint priority = 0;
+		char *help_text = NULL;
+		gint return_value = 0;
+		guint ret_id = 0;
+		g_variant_get (parameters, "(sisi)", &name, &priority, &help_text, &return_value);
+		remote_object_hook_command (obj, name, priority, help_text, return_value, &ret_id, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", ret_id));
+		g_free (name);
+		g_free (help_text);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "HookServer")) {
+		char *name = NULL;
+		gint priority = 0;
+		gint return_value = 0;
+		guint ret_id = 0;
+		g_variant_get (parameters, "(sii)", &name, &priority, &return_value);
+		remote_object_hook_server (obj, name, priority, return_value, &ret_id, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", ret_id));
+		g_free (name);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "HookPrint")) {
+		char *name = NULL;
+		gint priority = 0;
+		gint return_value = 0;
+		guint ret_id = 0;
+		g_variant_get (parameters, "(sii)", &name, &priority, &return_value);
+		remote_object_hook_print (obj, name, priority, return_value, &ret_id, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", ret_id));
+		g_free (name);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "Unhook")) {
+		guint id = 0;
+		g_variant_get (parameters, "(u)", &id);
+		remote_object_unhook (obj, id, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("()"));
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "ListGet")) {
+		char *name = NULL;
+		guint ret_id = 0;
+		g_variant_get (parameters, "(s)", &name);
+		remote_object_list_get (obj, name, &ret_id, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", ret_id));
+		g_free (name);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "ListNext")) {
+		guint id = 0;
+		gboolean ret = 0;
+		g_variant_get (parameters, "(u)", &id);
+		remote_object_list_next (obj, id, &ret, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(b)", ret));
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "ListStr")) {
+		guint id = 0;
+		char *name = NULL;
+		char *ret_str = NULL;
+		g_variant_get (parameters, "(us)", &id, &name);
+		remote_object_list_str (obj, id, name, &ret_str, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(s)", ret_str ? ret_str : ""));
+		g_free (name);
+		g_free (ret_str);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "ListInt")) {
+		guint id = 0;
+		char *name = NULL;
+		gint ret_int = 0;
+		g_variant_get (parameters, "(us)", &id, &name);
+		remote_object_list_int (obj, id, name, &ret_int, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(i)", ret_int));
+		g_free (name);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "ListTime")) {
+		guint id = 0;
+		char *name = NULL;
+		guint64 ret_time = 0;
+		g_variant_get (parameters, "(us)", &id, &name);
+		remote_object_list_time (obj, id, name, &ret_time, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(t)", ret_time));
+		g_free (name);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "ListFields")) {
+		char *name = NULL;
+		char **ret = NULL;
+		g_variant_get (parameters, "(s)", &name);
+		remote_object_list_fields (obj, name, &ret, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(^as)", ret));
+		g_free (name);
+		g_strfreev (ret);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "ListFree")) {
+		guint id = 0;
+		g_variant_get (parameters, "(u)", &id);
+		remote_object_list_free (obj, id, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("()"));
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "EmitPrint")) {
+		char *event_name = NULL;
+		char **args = NULL;
+		gboolean ret = 0;
+		g_variant_get (parameters, "(s^as)", &event_name, &args);
+		remote_object_emit_print (obj, event_name, (const char **)args, &ret, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(b)", ret));
+		g_free (event_name);
+		g_strfreev (args);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "Nickcmp")) {
+		char *nick1 = NULL;
+		char *nick2 = NULL;
+		gint ret = 0;
+		g_variant_get (parameters, "(ss)", &nick1, &nick2);
+		remote_object_nickcmp (obj, nick1, nick2, &ret, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(i)", ret));
+		g_free (nick1);
+		g_free (nick2);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "Strip")) {
+		char *str = NULL;
+		gint len = 0;
+		gint flag = 0;
+		char *ret_str = NULL;
+		g_variant_get (parameters, "(sii)", &str, &len, &flag);
+		remote_object_strip (obj, str, len, flag, &ret_str, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("(s)", ret_str ? ret_str : ""));
+		g_free (str);
+		g_free (ret_str);
+		g_object_unref (obj);
+		return;
+	}
+	if (g_str_equal (interface, "org.hexchat.plugin") && g_str_equal (method, "SendModes")) {
+		char **targets = NULL;
+		gint modes_per_line = 0;
+		guchar sign = 0;
+		guchar mode = 0;
+		g_variant_get (parameters, "(^asiyy)", &targets, &modes_per_line, &sign, &mode);
+		remote_object_send_modes (obj, (const char **)targets, modes_per_line, sign, mode, NULL);
+		g_dbus_method_invocation_return_value (invocation, g_variant_new ("()"));
+		g_strfreev (targets);
+		g_object_unref (obj);
+		return;
+	}
+	g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_METHOD, "Unknown method");
+	g_object_unref (obj);
+}
+
+static gboolean
+register_remote (RemoteObject *obj, GError **error)
+{
+	guint i;
+	static GDBusNodeInfo *info;
+	static const GDBusInterfaceVTable vtable = { method_call, NULL, NULL, { 0 } };
+	if (!info)
+		info = g_dbus_node_info_new_for_xml (remote_object_xml, NULL);
+	for (i = 0; i < 2; i++) {
+		obj->registrations[i] = g_dbus_connection_register_object (connection,
+			obj->dbus_path, info->interfaces[i], &vtable, obj, NULL, error);
+		if (!obj->registrations[i]) return FALSE;
+	}
+	return TRUE;
+}
 
 static void
-name_owner_changed (DBusGProxy *driver_proxy,
-		    const char *name,
-		    const char *old_owner,
-		    const char *new_owner,
-		    void       *user_data)
+name_owner_changed (GDBusConnection *bus, const char *sender, const char *path,
+                    const char *interface, const char *signal,
+                    GVariant *parameters, gpointer data)
 {
-	if (*new_owner == '\0') {
-		/* this name has vanished */
-		g_hash_table_remove (clients, name);
-	}
+	const char *name, *old_owner, *new_owner;
+	g_variant_get (parameters, "(&s&s&s)", &name, &old_owner, &new_owner);
+	if (!*new_owner) g_hash_table_remove (clients, name);
 }
 
 static gboolean
 init_dbus (void)
 {
-	DBusGProxy *proxy;
 	RemoteObject *remote;
-	guint request_name_result;
 	GError *error = NULL;
-
-	dbus_g_object_type_install_info (REMOTE_TYPE_OBJECT,
-					 &dbus_glib_remote_object_object_info);
-
-	connection = dbus_g_bus_get (DBUS_BUS_SESSION, &error);
-	if (connection == NULL) {
-		hexchat_printf (ph, _("Couldn't connect to session bus: %s\n"),
-			      error->message);
-		g_error_free (error);
-		return FALSE;
+	GVariant *reply;
+	guint request_name_result;
+	connection = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, &error);
+	if (!connection) goto fail;
+	reply = g_dbus_connection_call_sync (connection, "org.freedesktop.DBus",
+		"/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName",
+		g_variant_new ("(su)", DBUS_SERVICE, 1u), G_VARIANT_TYPE ("(u)"),
+		G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
+	if (!reply) goto fail;
+	g_variant_get (reply, "(u)", &request_name_result);
+	g_variant_unref (reply);
+	/* Keep queued instances exported so they can serve when the owner exits. */
+	if (request_name_result != 1 && request_name_result != 2 && request_name_result != 4) {
+		g_set_error (&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+			"Could not acquire %s (RequestName result %u)", DBUS_SERVICE, request_name_result);
+		goto fail;
 	}
-
-	proxy = dbus_g_proxy_new_for_name (connection,
-					   DBUS_SERVICE_DBUS,
-					   DBUS_PATH_DBUS,
-					   DBUS_INTERFACE_DBUS);
-
-	if (!dbus_g_proxy_call (proxy, "RequestName", &error,
-				G_TYPE_STRING, DBUS_SERVICE,
-				G_TYPE_UINT, DBUS_NAME_FLAG_ALLOW_REPLACEMENT,
-				G_TYPE_INVALID,
-				G_TYPE_UINT, &request_name_result,
-				G_TYPE_INVALID)) {
-		hexchat_printf (ph, _("Failed to acquire %s: %s\n"),
-			      DBUS_SERVICE,
-			      error->message);
-		g_error_free (error);
-
-		return FALSE;
-	}
-
-	dbus_g_proxy_add_signal (proxy, "NameOwnerChanged",
-				 G_TYPE_STRING,
-				 G_TYPE_STRING,
-				 G_TYPE_STRING,
-				 G_TYPE_INVALID);
-	dbus_g_proxy_connect_signal (proxy, "NameOwnerChanged", 
-				     G_CALLBACK (name_owner_changed),
-				     NULL, NULL);
-
+	g_dbus_connection_signal_subscribe (connection, "org.freedesktop.DBus",
+		"org.freedesktop.DBus", "NameOwnerChanged", "/org/freedesktop/DBus",
+		NULL, G_DBUS_SIGNAL_FLAGS_NONE, name_owner_changed, NULL, NULL);
 	remote = g_object_new (REMOTE_TYPE_OBJECT, NULL);
-	dbus_g_connection_register_g_object (connection,
-					     DBUS_OBJECT_PATH"/Remote",
-					     G_OBJECT (remote));
-
+	remote->dbus_path = g_strdup (DBUS_OBJECT_PATH "/Remote");
+	if (!register_remote (remote, &error)) {
+		g_object_unref (remote);
+		goto fail;
+	}
 	return TRUE;
+fail:
+	hexchat_printf (ph, _("Couldn't initialize session bus: %s\n"), error->message);
+	g_clear_error (&error);
+	g_clear_object (&connection);
+	return FALSE;
 }
 
 /* hexchat_plugin stuffs */
@@ -1041,9 +1260,8 @@ unload_plugin_cb (char *word[], char *word_eol[], void *userdata)
 				 clients_find_filename_foreach,
 				 word[2]);
 	if (obj != NULL) {
-		g_signal_emit (obj, 
-			       signals[UNLOAD_SIGNAL],
-			       0);
+		g_dbus_connection_emit_signal (connection, NULL, obj->dbus_path,
+		"org.hexchat.plugin", "UnloadSignal", NULL, NULL);
 		return HEXCHAT_EAT_ALL;
 	}
 	

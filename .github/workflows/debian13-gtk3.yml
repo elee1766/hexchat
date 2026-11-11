@@ -25,9 +25,9 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates git build-essential meson ninja-build pkg-config gettext \
             desktop-file-utils appstream appstream-util libglib2.0-dev libgtk-3-dev \
-            libssl-dev libcanberra-dev libdbus-glib-1-dev libluajit-5.1-dev \
+            libssl-dev libcanberra-dev dbus-daemon libluajit-5.1-dev \
             libpci-dev libperl-dev python3-dev python3-cffi \
-            openssl librsvg2-common xvfb xdotool xclip x11-apps openbox imagemagick dbus-x11 fonts-dejavu-core
+            openssl librsvg2-common xvfb xauth xdotool xclip x11-apps openbox imagemagick dbus-x11 fonts-dejavu-core
 
       - uses: actions/checkout@v6
         with:
@@ -47,12 +47,21 @@ jobs:
           test -x build/src/fe-gtk/hexchat
           test -x build/src/fe-text/hexchat-text
 
-      - name: Unit tests (TLS, fishlim, data validation)
-        run: meson test -C build --print-errorlogs
+      - name: Unit and private session-bus integration tests
+        run: |
+          useradd -m tester
+          chown -R tester .
+          su tester -c "meson test -C build --print-errorlogs"
+
+      - name: App-id D-Bus service and disabled build
+        run: |
+          su tester -c "meson configure build -Ddbus-service-use-appid=true && meson compile -C build && meson test -C build --print-errorlogs 'D-Bus scripting API' 'D-Bus GTK single instance'"
+          meson setup build-no-dbus -Ddbus=disabled -Dgtk-frontend=false -Dtext-frontend=true -Dwith-lua=false -Dwith-perl=false -Dwith-python=false -Dwith-sysinfo=false -Dwith-fishlim=false
+          meson compile -C build-no-dbus
+          meson test -C build-no-dbus --print-errorlogs
 
       - name: TLS IRC end-to-end test (loopback only)
         run: |
-          useradd -m tester
           chmod -R a+rX .
           su tester -c "./ci/tls-irc-test.sh build"
 

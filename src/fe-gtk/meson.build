@@ -36,7 +36,7 @@ hexchat_gtk_deps = [
 ]
 
 # GTK3 renamed the pkg-config variable to "targets" (a list)
-if 'x11' in gtk_dep.get_pkgconfig_variable('targets').split()
+if gtk_dep.get_pkgconfig_variable('targets').split().contains('x11')
   hexchat_gtk_deps += dependency('x11')
 endif
 
@@ -81,7 +81,7 @@ if host_machine.system() == 'windows'
   hexchat_gtk_ldflags += '-Wl,-e,mainCRTStartup'
 endif
 
-executable('hexchat',
+hexchat_gtk = executable('hexchat',
   sources:  resources + hexchat_gtk_sources,
   dependencies: hexchat_gtk_deps,
   c_args: hexchat_gtk_cflags,

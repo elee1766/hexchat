@@ -19,185 +19,63 @@
  * xclaesse@gmail.com
  */
 
-#include <config.h>
-#include <dbus/dbus-glib.h>
-#include <stdlib.h>
-#include "../marshal.c"
-
-#define DBUS_SERVICE "org.hexchat.service"
-#define DBUS_REMOTE "/org/hexchat/Remote"
-#define DBUS_REMOTE_CONNECTION_INTERFACE "org.hexchat.connection"
-#define DBUS_REMOTE_PLUGIN_INTERFACE "org.hexchat.plugin"
-
-guint command_id;
-guint server_id;
+/* Compile with: cc example.c $(pkg-config --cflags --libs gio-2.0) -o example */
+#include <gio/gio.h>
 
 static void
-write_error (const char *message,
-	     GError **error)
+signal_cb (GDBusProxy *proxy, const char *sender, const char *name,
+           GVariant *parameters, gpointer data)
 {
-	if (error == NULL || *error == NULL) {
-		return;
-	}
-	g_printerr ("%s: %s\n", message, (*error)->message);
-	g_clear_error (error);
-}
-
-static void
-test_server_cb (DBusGProxy *proxy,
-		char *word[],
-		char *word_eol[],
-		guint hook_id,
-		guint context_id,
-		gpointer user_data)
-{
-	if (hook_id == server_id) {
-		g_print ("message: %s\n", word_eol[0]);
-	}
-}
-
-static void
-test_command_cb (DBusGProxy *proxy,
-		 char *word[],
-		 char *word_eol[],
-		 guint hook_id,
-		 guint context_id,
-		 gpointer user_data)
-{
-	GError *error = NULL;
-
-	if (hook_id == command_id) {
-		if (!dbus_g_proxy_call (proxy, "Unhook",
-					&error,
-					G_TYPE_UINT, hook_id,
-					G_TYPE_INVALID, G_TYPE_INVALID)) {
-			write_error ("Failed to complete unhook", &error);
-		}
-		/* Now if you write "/test blah" again in the HexChat window
-		 * you'll get a "Unknown command" error message */
-		g_print ("test command received: %s\n", word_eol[1]);
-		if (!dbus_g_proxy_call (proxy, "Print",
-					&error,
-					G_TYPE_STRING, "test command succeed",
-					G_TYPE_INVALID,
-					G_TYPE_INVALID)) {
-			write_error ("Failed to complete Print", &error);
-		}
-	}
-}
-
-static void
-unload_cb (void)
-{
-	g_print ("Good bye !\n");
-	exit (EXIT_SUCCESS);
+ if (g_str_equal (name, "UnloadSignal"))
+  g_main_loop_quit (data);
+ else {
+  char *text = g_variant_print (parameters, TRUE);
+  g_print ("%s: %s\n", name, text);
+  g_free (text);
+ }
 }
 
 int
 main (int argc, char **argv)
 {
-	DBusGConnection *connection;
-	DBusGProxy *remote_object;
-	GMainLoop *mainloop;
-	gchar *path;
-	GError *error = NULL;
-
-#if ! GLIB_CHECK_VERSION (2, 36, 0)
-	g_type_init ();
-#endif
-
-	connection = dbus_g_bus_get (DBUS_BUS_SESSION, &error);
-	if (connection == NULL) {
-		write_error ("Couldn't connect to session bus", &error);
-		return EXIT_FAILURE;
-	}
-  
-	remote_object = dbus_g_proxy_new_for_name (connection,
-						   DBUS_SERVICE,
-						   DBUS_REMOTE,
-						   DBUS_REMOTE_CONNECTION_INTERFACE);
-	if (!dbus_g_proxy_call (remote_object, "Connect",
-				&error,
-				G_TYPE_STRING, argv[0],
-				G_TYPE_STRING, "example",
-				G_TYPE_STRING, "Example of a D-Bus client",
-				G_TYPE_STRING, "1.0",
-				G_TYPE_INVALID,
-				G_TYPE_STRING, &path, G_TYPE_INVALID)) {
-		write_error ("Failed to complete Connect", &error);
-		return EXIT_FAILURE;
-	}
-	g_object_unref (remote_object);
-
-	remote_object = dbus_g_proxy_new_for_name (connection,
-						   DBUS_SERVICE,
-						   path,
-						   DBUS_REMOTE_PLUGIN_INTERFACE);
-	g_free (path);
-
-	if (!dbus_g_proxy_call (remote_object, "HookCommand",
-				&error,
-				G_TYPE_STRING, "test",
-				G_TYPE_INT, 0,
-				G_TYPE_STRING, "Simple D-BUS example",
-				G_TYPE_INT, 1, G_TYPE_INVALID,
-				G_TYPE_UINT, &command_id, G_TYPE_INVALID)) {
-		write_error ("Failed to complete HookCommand", &error);
-		return EXIT_FAILURE;
-	}
-	g_print ("Command hook id=%d\n", command_id);
-
-	if (!dbus_g_proxy_call (remote_object, "HookServer",
-				&error,
-				G_TYPE_STRING, "RAW LINE",
-				G_TYPE_INT, 0,
-				G_TYPE_INT, 0, G_TYPE_INVALID,
-				G_TYPE_UINT, &server_id, G_TYPE_INVALID)) {
-		write_error ("Failed to complete HookServer", &error);
-		return EXIT_FAILURE;
-	}
-	g_print ("Server hook id=%d\n", server_id);
-
-	dbus_g_object_register_marshaller (
-		_hexchat_marshal_VOID__POINTER_POINTER_UINT_UINT,
-		G_TYPE_NONE,
-		G_TYPE_STRV, G_TYPE_STRV, G_TYPE_UINT, G_TYPE_UINT,
-		G_TYPE_INVALID);
-
-	dbus_g_object_register_marshaller (
-		g_cclosure_marshal_VOID__VOID,
-		G_TYPE_NONE,
-		G_TYPE_INVALID);
-
-	dbus_g_proxy_add_signal (remote_object, "CommandSignal",
-				 G_TYPE_STRV,
-				 G_TYPE_STRV,
-				 G_TYPE_UINT,
-				 G_TYPE_UINT,
-				 G_TYPE_INVALID);
-	dbus_g_proxy_connect_signal (remote_object, "CommandSignal",
-				     G_CALLBACK (test_command_cb),
-				     NULL, NULL);
-
-	dbus_g_proxy_add_signal (remote_object, "ServerSignal",
-				 G_TYPE_STRV,
-				 G_TYPE_STRV,
-				 G_TYPE_UINT,
-				 G_TYPE_UINT,
-				 G_TYPE_INVALID);
-	dbus_g_proxy_connect_signal (remote_object, "ServerSignal",
-				     G_CALLBACK (test_server_cb),
-				     NULL, NULL);
-
-	dbus_g_proxy_add_signal (remote_object, "UnloadSignal",
-				 G_TYPE_INVALID);
-	dbus_g_proxy_connect_signal (remote_object, "UnloadSignal",
-				     G_CALLBACK (unload_cb),
-				     NULL, NULL);
-
-	/* Now you can write on the HexChat windows: "/test arg1 arg2 ..." */
-	mainloop = g_main_loop_new (NULL, FALSE);
-	g_main_loop_run (mainloop);
-
-	return EXIT_SUCCESS;
+ GError *error = NULL;
+ const char *service = argc > 1 ? argv[1] : "org.hexchat.service";
+ GDBusConnection *bus = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, &error);
+ if (!bus) goto fail;
+ GVariant *reply = g_dbus_connection_call_sync (bus, service,
+  "/org/hexchat/Remote", "org.hexchat.connection", "Connect",
+  g_variant_new ("(ssss)", argv[0], "example", "Example D-Bus client", "1.0"),
+  G_VARIANT_TYPE ("(s)"), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
+ if (!reply) goto fail;
+ const char *path;
+ g_variant_get (reply, "(&s)", &path);
+ GDBusProxy *proxy = g_dbus_proxy_new_sync (bus, G_DBUS_PROXY_FLAGS_NONE,
+  NULL, service, path, "org.hexchat.plugin", NULL, &error);
+ g_variant_unref (reply);
+ if (!proxy) goto fail;
+ GMainLoop *loop = g_main_loop_new (NULL, FALSE);
+ g_signal_connect (proxy, "g-signal", G_CALLBACK (signal_cb), loop);
+ reply = g_dbus_proxy_call_sync (proxy, "HookCommand",
+  g_variant_new ("(sisi)", "test", 0, "D-Bus example", 1),
+  G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
+ if (!reply) goto fail;
+ g_variant_unref (reply);
+ reply = g_dbus_proxy_call_sync (proxy, "HookServer",
+  g_variant_new ("(sii)", "RAW LINE", 0, 0),
+  G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
+ if (!reply) goto fail;
+ g_variant_unref (reply);
+ g_main_loop_run (loop);
+ reply = g_dbus_connection_call_sync (bus, service, g_dbus_proxy_get_object_path (proxy),
+  "org.hexchat.connection", "Disconnect", NULL, NULL,
+  G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
+ if (reply) g_variant_unref (reply);
+ g_main_loop_unref (loop);
+ g_object_unref (proxy);
+ g_object_unref (bus);
+ return 0;
+fail:
+ g_printerr ("%s\n", error->message);
+ g_clear_error (&error);
+ return 1;
 }
