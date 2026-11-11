@@ -58,7 +58,7 @@
 #include <canberra.h>
 #endif
 
-GdkPixmap *channelwin_pix;
+cairo_surface_t *channelwin_pix;
 
 #ifdef USE_LIBCANBERRA
 static ca_context *ca_con;
@@ -247,36 +247,18 @@ fe_args (int argc, char *argv[])
 	return -1;
 }
 
-const char cursor_color_rc[] =
-	"style \"xc-ib-st\""
-	"{"
-		"GtkEntry::cursor-color=\"#%02x%02x%02x\""
-	"}"
-	"widget \"*.hexchat-inputbox\" style : application \"xc-ib-st\"";
-
-static const char adwaita_workaround_rc[] =
-	"style \"hexchat-input-workaround\""
-	"{"
-		"engine \"pixmap\" {"
-			"image {"
-				"function = FLAT_BOX\n"
-				"state    = NORMAL\n"
-			"}"
-			"image {"
-				"function = FLAT_BOX\n"
-				"state    = ACTIVE\n"
-			"}"
-		"}"
-	"}"
-	"widget \"*.hexchat-inputbox\" style \"hexchat-input-workaround\"";
-
-GtkStyle *
-create_input_style (GtkStyle *style)
+/* font of the text box, also used by the user list and channel tree when
+ * "Use the text box font and colors" is set.  Colors come from the palette. */
+InputStyle *
+create_input_style (InputStyle *style)
 {
 	char buf[256];
-	static int done_rc = FALSE;
 
-	pango_font_description_free (style->font_desc);
+	if (!style)
+		style = g_new0 (InputStyle, 1);
+
+	if (style->font_desc)
+		pango_font_description_free (style->font_desc);
 	style->font_desc = pango_font_description_from_string (prefs.hex_text_font);
 
 	/* fall back */
@@ -288,29 +270,16 @@ create_input_style (GtkStyle *style)
 		style->font_desc = pango_font_description_from_string ("sans 11");
 	}
 
-	if (prefs.hex_gui_input_style && !done_rc)
-	{
-		GtkSettings *settings = gtk_settings_get_default ();
-		char *theme_name;
-
-		/* gnome-themes-standard 3.20+ relies on images to do theming
-		 * so we have to override that. */
-		g_object_get (settings, "gtk-theme-name", &theme_name, NULL);
-		if (g_str_has_prefix (theme_name, "Adwaita") || g_str_has_prefix (theme_name, "Yaru"))
-			gtk_rc_parse_string (adwaita_workaround_rc);
-		g_free (theme_name);
-
-		done_rc = TRUE;
-		sprintf (buf, cursor_color_rc, (colors[COL_FG].red >> 8),
-			(colors[COL_FG].green >> 8), (colors[COL_FG].blue >> 8));
-		gtk_rc_parse_string (buf);
-	}
-
-	style->bg[GTK_STATE_NORMAL] = colors[COL_FG];
-	style->base[GTK_STATE_NORMAL] = colors[COL_BG];
-	style->text[GTK_STATE_NORMAL] = colors[COL_FG];
-
 	return style;
+}
+
+/* give a widget the text box font and colors (the caret follows the text color) */
+void
+input_style_apply (GtkWidget *widget)
+{
+	gtk_widget_modify_base (widget, GTK_STATE_NORMAL, &colors[COL_BG]);
+	gtk_widget_modify_text (widget, GTK_STATE_NORMAL, &colors[COL_FG]);
+	gtk_widget_modify_font (widget, input_style->font_desc);
 }
 
 void
@@ -324,7 +293,7 @@ fe_init (void)
 	gtkosx_application_set_dock_icon_pixbuf (osx_app, pix_hexchat);
 #endif
 	channelwin_pix = pixmap_load_from_file (prefs.hex_text_background);
-	input_style = create_input_style (gtk_style_new ());
+	input_style = create_input_style (NULL);
 }
 
 #ifdef HAVE_GTK_MAC

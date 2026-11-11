@@ -84,10 +84,22 @@ _SSL_context_init (void (*info_cb_func))
 {
 	SSL_CTX *ctx;
 
-	SSLeay_add_ssl_algorithms ();
-	SSL_load_error_strings ();
-	ctx = SSL_CTX_new (SSLv23_client_method ());
+	ctx = SSL_CTX_new (TLS_client_method ());
+	if (ctx == NULL)
+	{
+		__SSL_fill_err_buf ("SSL_CTX_new");
+		fprintf (stderr, "%s\n", err_buf);
+		return NULL;
+	}
 
+	/* Fail closed: never hand back a context that allows older protocols. */
+	if (!SSL_CTX_set_min_proto_version (ctx, HEXCHAT_TLS_MIN_VERSION))
+	{
+		__SSL_fill_err_buf ("SSL_CTX_set_min_proto_version");
+		fprintf (stderr, "%s\n", err_buf);
+		SSL_CTX_free (ctx);
+		return NULL;
+	}
 	SSL_CTX_set_session_cache_mode (ctx, SSL_SESS_CACHE_BOTH);
 	SSL_CTX_set_timeout (ctx, 300);
 	SSL_CTX_set_options (ctx, SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3
@@ -95,10 +107,6 @@ _SSL_context_init (void (*info_cb_func))
 							  |SSL_OP_SINGLE_DH_USE|SSL_OP_SINGLE_ECDH_USE
 							  |SSL_OP_NO_TICKET
 							  |SSL_OP_CIPHER_SERVER_PREFERENCE);
-
-#if OPENSSL_VERSION_NUMBER >= 0x00908000L && !defined (OPENSSL_NO_COMP) /* workaround for OpenSSL 0.9.8 */
-	sk_SSL_COMP_zero(SSL_COMP_get_compression_methods());
-#endif
 
 	/* used in SSL_connect(), SSL_accept() */
 	SSL_CTX_set_info_callback (ctx, info_cb_func);
@@ -161,7 +169,7 @@ _SSL_get_cert_info (struct cert_info *cert_info, SSL * ssl)
 	int sign_alg;
 
 
-	if (!(peer_cert = SSL_get_peer_certificate (ssl)))
+	if (!(peer_cert = _SSL_get_peer_cert (ssl)))
 		return (1);				  /* FATAL? */
 
 	X509_NAME_oneline (X509_get_subject_name (peer_cert), cert_info->subject,
@@ -176,11 +184,7 @@ _SSL_get_cert_info (struct cert_info *cert_info, SSL * ssl)
 		return 1;
 
 	alg = OBJ_obj2nid (algor->algorithm);
-#ifndef HAVE_X509_GET_SIGNATURE_NID
-	sign_alg = OBJ_obj2nid (peer_cert->sig_alg->algorithm);
-#else
 	sign_alg = X509_get_signature_nid (peer_cert);
-#endif
 	ASN1_TIME_snprintf (notBefore, sizeof (notBefore),
 							  X509_get_notBefore (peer_cert));
 	ASN1_TIME_snprintf (notAfter, sizeof (notAfter),
@@ -306,12 +310,8 @@ _SSL_socket (SSL_CTX *ctx, int sd)
 
 	SSL_set_fd (ssl, sd);
 
-#ifndef HAVE_SSL_CTX_GET_SSL_METHOD
-	method = ctx->method;
-#else
 	method = SSL_CTX_get_ssl_method (ctx);
-#endif
-	if (method == SSLv23_client_method())
+	if (method == TLS_client_method())
 		SSL_set_connect_state (ssl);
 	else
 	        SSL_set_accept_state(ssl);
@@ -348,14 +348,6 @@ _SSL_close (SSL * ssl)
 {
 	SSL_set_shutdown (ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
 	SSL_free (ssl);
-#ifdef HAVE_ERR_REMOVE_THREAD_STATE
-#if OPENSSL_VERSION_NUMBER >= 0x10000000L && OPENSSL_VERSION_NUMBER < 0x10100000L
-	/* OpenSSL handles this itself in 1.1+ and this is a no-op */
-	ERR_remove_thread_state (NULL);
-#endif
-#else
-	ERR_remove_state (0);
-#endif
 }
 
 /* Hostname validation code based on OpenBSD's libtls. */
@@ -444,19 +436,15 @@ _SSL_check_subject_altname (X509 *cert, const char *host)
 
 		if (type == GEN_DNS)
 		{
-			const unsigned char *data;
+			const char *data;
 			int format;
 
 			format = ASN1_STRING_type (altname->d.dNSName);
 			if (format == V_ASN1_IA5STRING)
 			{
-#ifdef HAVE_ASN1_STRING_GET0_DATA
-				data = ASN1_STRING_get0_data (altname->d.dNSName);
-#else
-				data = ASN1_STRING_data (altname->d.dNSName);
-#endif
+				data = (const char *) ASN1_STRING_get0_data (altname->d.dNSName);
 
-				if (ASN1_STRING_length (altname->d.dNSName) != (int)strlen(data))
+				if (ASN1_STRING_length (altname->d.dNSName) != (int)strlen (data))
 				{
 					g_warning("NUL byte in subjectAltName, probably a malicious certificate.\n");
 					rv = -2;
@@ -480,11 +468,7 @@ _SSL_check_subject_altname (X509 *cert, const char *host)
 			int datalen, addr_len;
 
 			datalen = ASN1_STRING_length (altname->d.iPAddress);
-#ifdef HAVE_ASN1_STRING_GET0_DATA
 			data = ASN1_STRING_get0_data (altname->d.iPAddress);
-#else
-			data = ASN1_STRING_data (altname->d.iPAddress);
-#endif
 
 			addr_bytes = g_inet_address_to_bytes (addr);
 			addr_len = (int)g_inet_address_get_native_size (addr);

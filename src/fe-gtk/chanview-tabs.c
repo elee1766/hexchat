@@ -45,39 +45,23 @@ static int tab_right_is_moving = 0;
  *
  */
 
-/*
- * GtkViewports request at least as much space as their children do.
- * If we don't intervene here, the GtkViewport will be granted its
- * request, even at the expense of resizing the top-level window.
- */
-static void
-cv_tabs_sizerequest (GtkWidget *viewport, GtkRequisition *requisition, chanview *cv)
-{
-	if (!cv->vertical)
-		requisition->width = 1;
-	else
-		requisition->height = 1;
-}
-
 static void
 cv_tabs_sizealloc (GtkWidget *widget, GtkAllocation *allocation, chanview *cv)
 {
-	GdkWindow *parent_win;
 	GtkAdjustment *adj;
 	GtkWidget *inner;
 	gint viewport_size;
 
 	inner = ((tabview *)cv)->inner;
-	parent_win = gtk_widget_get_window (gtk_widget_get_parent (inner));
 
 	if (cv->vertical)
 	{
 		adj = gtk_viewport_get_vadjustment (GTK_VIEWPORT (gtk_widget_get_parent (inner)));
-		gdk_window_get_geometry (parent_win, 0, 0, 0, &viewport_size, 0);
+		viewport_size = gtk_widget_get_allocated_height (gtk_widget_get_parent (inner));
 	} else
 	{
 		adj = gtk_viewport_get_hadjustment (GTK_VIEWPORT (gtk_widget_get_parent (inner)));
-		gdk_window_get_geometry (parent_win, 0, 0, &viewport_size, 0, 0);
+		viewport_size = gtk_widget_get_allocated_width (gtk_widget_get_parent (inner));
 	}
 
 	if (gtk_adjustment_get_upper (adj) <= viewport_size)
@@ -141,20 +125,18 @@ tab_scroll_left_up_clicked (GtkWidget *widget, chanview *cv)
 	gint viewport_size;
 	gfloat new_value;
 	GtkWidget *inner;
-	GdkWindow *parent_win;
 	gdouble i;
 
 	inner = ((tabview *)cv)->inner;
-	parent_win = gtk_widget_get_window (gtk_widget_get_parent (inner));
 
 	if (cv->vertical)
 	{
 		adj = gtk_viewport_get_vadjustment (GTK_VIEWPORT (gtk_widget_get_parent(inner)));
-		gdk_window_get_geometry (parent_win, 0, 0, 0, &viewport_size, 0);
+		viewport_size = gtk_widget_get_allocated_height (gtk_widget_get_parent (inner));
 	} else
 	{
 		adj = gtk_viewport_get_hadjustment (GTK_VIEWPORT (gtk_widget_get_parent(inner)));
-		gdk_window_get_geometry (parent_win, 0, 0, &viewport_size, 0, 0);
+		viewport_size = gtk_widget_get_allocated_width (gtk_widget_get_parent (inner));
 	}
 
 	new_value = tab_search_offset (inner, gtk_adjustment_get_value (adj), 0, cv->vertical);
@@ -190,20 +172,18 @@ tab_scroll_right_down_clicked (GtkWidget *widget, chanview *cv)
 	gint viewport_size;
 	gfloat new_value;
 	GtkWidget *inner;
-	GdkWindow *parent_win;
 	gdouble i;
 
 	inner = ((tabview *)cv)->inner;
-	parent_win = gtk_widget_get_window (gtk_widget_get_parent (inner));
 
 	if (cv->vertical)
 	{
 		adj = gtk_viewport_get_vadjustment (GTK_VIEWPORT (gtk_widget_get_parent(inner)));
-		gdk_window_get_geometry (parent_win, 0, 0, 0, &viewport_size, 0);
+		viewport_size = gtk_widget_get_allocated_height (gtk_widget_get_parent (inner));
 	} else
 	{
 		adj = gtk_viewport_get_hadjustment (GTK_VIEWPORT (gtk_widget_get_parent(inner)));
-		gdk_window_get_geometry (parent_win, 0, 0, &viewport_size, 0, 0);
+		viewport_size = gtk_widget_get_allocated_width (gtk_widget_get_parent (inner));
 	}
 
 	new_value = tab_search_offset (inner, gtk_adjustment_get_value (adj), 1, cv->vertical);
@@ -254,6 +234,14 @@ tab_scroll_cb (GtkWidget *widget, GdkEventScroll *event, gpointer cv)
 	return FALSE;
 }
 
+/* the scrolled window would scroll by itself too, don't let it */
+static gboolean
+tab_viewport_scroll_cb (GtkWidget *widget, GdkEventScroll *event, gpointer cv)
+{
+	tab_scroll_cb (widget, event, cv);
+	return TRUE;
+}
+
 static void
 cv_tabs_xclick_cb (GtkWidget *button, chanview *cv)
 {
@@ -298,12 +286,20 @@ cv_tabs_init (chanview *cv)
 /*	gtk_container_set_border_width (GTK_CONTAINER (outer), 2);*/
 	gtk_widget_show (outer);
 
-	viewport = gtk_viewport_new (0, 0);
-	gtk_viewport_set_shadow_type (GTK_VIEWPORT (viewport), GTK_SHADOW_NONE);
-	g_signal_connect (G_OBJECT (viewport), "size_request",
-							G_CALLBACK (cv_tabs_sizerequest), cv);
+	/* A GtkViewport always requests as much space as its child, which would
+	 * make the toplevel refuse to shrink.  With an external policy the
+	 * scrolled window does not report the child's size along the scrolling
+	 * direction, and it wraps the box in a viewport for us. */
+	viewport = gtk_scrolled_window_new (NULL, NULL);
+	gtk_scrolled_window_set_shadow_type (GTK_SCROLLED_WINDOW (viewport), GTK_SHADOW_NONE);
+	if (cv->vertical)
+		gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (viewport),
+												  GTK_POLICY_NEVER, GTK_POLICY_EXTERNAL);
+	else
+		gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (viewport),
+												  GTK_POLICY_EXTERNAL, GTK_POLICY_NEVER);
 	g_signal_connect (G_OBJECT (viewport), "scroll_event",
-							G_CALLBACK (tab_scroll_cb), cv);
+							G_CALLBACK (tab_viewport_scroll_cb), cv);
 	gtk_box_pack_start (GTK_BOX (outer), viewport, 1, 1, 0);
 	gtk_widget_show (viewport);
 

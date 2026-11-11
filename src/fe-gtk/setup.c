@@ -44,7 +44,7 @@
 #endif
 #include "sexy-spell-entry.h"
 
-GtkStyle *create_input_style (GtkStyle *);
+InputStyle *create_input_style (InputStyle *);
 
 #define LABEL_INDENT 12
 
@@ -1406,11 +1406,8 @@ setup_color_ok_cb (GtkWidget *button, GtkWidget *dialog)
 {
 	GtkColorSelectionDialog *cdialog = GTK_COLOR_SELECTION_DIALOG (dialog);
 	GdkColor *col;
-	GdkColor old_color;
-	GtkStyle *style;
 
 	col = g_object_get_data (G_OBJECT (button), "c");
-	old_color = *col;
 
 	button = g_object_get_data (G_OBJECT (button), "b");
 
@@ -1424,15 +1421,7 @@ setup_color_ok_cb (GtkWidget *button, GtkWidget *dialog)
 
 	gtk_color_selection_get_current_color (GTK_COLOR_SELECTION (gtk_color_selection_dialog_get_color_selection (cdialog)), col);
 
-	gdk_colormap_alloc_color (gtk_widget_get_colormap (button), col, TRUE, TRUE);
-
-	style = gtk_style_new ();
-	style->bg[0] = *col;
-	gtk_widget_set_style (button, style);
-	g_object_unref (style);
-
-	/* is this line correct?? */
-	gdk_colormap_free_colors (gtk_widget_get_colormap (button), &old_color, 1);
+	gtk_widget_modify_bg (button, GTK_STATE_NORMAL, col);
 
 	gtk_widget_destroy (dialog);
 }
@@ -1475,7 +1464,6 @@ static void
 setup_create_color_button (GtkWidget *table, int num, int row, int col)
 {
 	GtkWidget *but;
-	GtkStyle *style;
 	char buf[64];
 
 	if (num > 31)
@@ -1491,10 +1479,7 @@ setup_create_color_button (GtkWidget *table, int num, int row, int col)
 							GTK_SHRINK | GTK_FILL, GTK_SHRINK | GTK_FILL, 0, 0);
 	g_signal_connect (G_OBJECT (but), "clicked",
 							G_CALLBACK (setup_color_cb), GINT_TO_POINTER (num));
-	style = gtk_style_new ();
-	style->bg[GTK_STATE_NORMAL] = colors[num];
-	gtk_widget_set_style (but, style);
-	g_object_unref (style);
+	gtk_widget_modify_bg (but, GTK_STATE_NORMAL, &colors[num]);
 }
 
 static void
@@ -2039,9 +2024,7 @@ setup_create_tree (GtkWidget *box, GtkWidget *book)
 static void
 setup_apply_entry_style (GtkWidget *entry)
 {
-	gtk_widget_modify_base (entry, GTK_STATE_NORMAL, &colors[COL_BG]);
-	gtk_widget_modify_text (entry, GTK_STATE_NORMAL, &colors[COL_FG]);
-	gtk_widget_modify_font (entry, input_style->font_desc);
+	input_style_apply (entry);
 }
 
 static void
@@ -2050,18 +2033,10 @@ setup_apply_to_sess (session_gui *gui)
 	mg_update_xtext (gui->xtext);
 
 	if (prefs.hex_gui_ulist_style)
-		gtk_widget_set_style (gui->user_tree, input_style);
+		input_style_apply (gui->user_tree);
 
 	if (prefs.hex_gui_input_style)
 	{
-		extern char cursor_color_rc[];
-		char buf[256];
-		sprintf (buf, cursor_color_rc,
-				(colors[COL_FG].red >> 8),
-				(colors[COL_FG].green >> 8),
-				(colors[COL_FG].blue >> 8));
-		gtk_rc_parse_string (buf);
-
 		setup_apply_entry_style (gui->input_box);
 		setup_apply_entry_style (gui->limit_entry);
 		setup_apply_entry_style (gui->key_entry);
@@ -2113,7 +2088,7 @@ setup_apply_real (int new_pix, int do_ulist, int do_layout, int do_identd)
 	if (new_pix)
 	{
 		if (channelwin_pix)
-			g_object_unref (channelwin_pix);
+			cairo_surface_destroy (channelwin_pix);
 		channelwin_pix = pixmap_load_from_file (prefs.hex_text_background);
 	}
 

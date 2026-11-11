@@ -53,6 +53,13 @@ char *_SSL_set_verify (SSL_CTX *ctx, void *(verify_callback));
 */
 void _SSL_close (SSL * ssl);
 int _SSL_check_hostname(X509 *cert, const char *host);
+
+/* Oldest TLS protocol version HexChat will negotiate as a client. TLS 1.0 and
+ * 1.1 were deprecated by RFC 8996; SSLv2/v3 stay disabled via SSL_OP_NO_*. */
+#define HEXCHAT_TLS_MIN_VERSION TLS1_2_VERSION
+
+/* Returns a new reference to the peer certificate (caller frees), or NULL */
+#define _SSL_get_peer_cert(ssl) SSL_get1_peer_certificate (ssl)
 int _SSL_get_cert_info (struct cert_info *cert_info, SSL * ssl);
 struct chiper_info *_SSL_get_cipher_info (SSL * ssl);
 

@@ -88,7 +88,7 @@ static const char chan_flags[] = { 'c', 'n', 't', 'i', 'm', 'l', 'k' };
 static chan *active_tab = NULL;	/* active tab */
 GtkWidget *parent_window = NULL;			/* the master window */
 
-GtkStyle *input_style;
+InputStyle *input_style;
 
 static PangoAttrList *away_list;
 static PangoAttrList *newdata_list;
@@ -559,13 +559,11 @@ mg_progressbar_update (GtkWidget *bar)
 		if (type == 0)
 		{
 			type = 1;
-			gtk_progress_bar_set_orientation ((GtkProgressBar *) bar,
-														 GTK_PROGRESS_RIGHT_TO_LEFT);
+			gtk_progress_bar_set_inverted ((GtkProgressBar *) bar, TRUE);
 		} else
 		{
 			type = 0;
-			gtk_progress_bar_set_orientation ((GtkProgressBar *) bar,
-														 GTK_PROGRESS_LEFT_TO_RIGHT);
+			gtk_progress_bar_set_inverted ((GtkProgressBar *) bar, FALSE);
 		}
 		pos = 0.05;
 	}
@@ -2061,9 +2059,7 @@ mg_limit_entry_cb (GtkWidget * igad, gpointer userdata)
 static void
 mg_apply_entry_style (GtkWidget *entry)
 {
-	gtk_widget_modify_base (entry, GTK_STATE_NORMAL, &colors[COL_BG]);
-	gtk_widget_modify_text (entry, GTK_STATE_NORMAL, &colors[COL_FG]);
-	gtk_widget_modify_font (entry, input_style->font_desc);
+	input_style_apply (entry);
 }
 
 static void
@@ -2479,8 +2475,7 @@ mg_create_userlist (session_gui *gui, GtkWidget *box)
 
 	if (prefs.hex_gui_ulist_style)
 	{
-		gtk_widget_set_style (ulist, input_style);
-		gtk_widget_modify_base (ulist, GTK_STATE_NORMAL, &colors[COL_BG]);
+		input_style_apply (ulist);
 	}
 
 	mg_create_meters (gui, vbox);
@@ -3779,24 +3774,35 @@ mg_is_gui_target (GdkDragContext *context)
 	return TRUE;
 }
 
+static void mg_drag_set_half (GtkWidget *widget, int half);
+static void mg_drag_leave_cb (GtkWidget *widget, GdkDragContext *context, guint time, gpointer userdata);
+
 /* this begin callback just creates an nice of the source */
 
 gboolean
 mg_drag_begin_cb (GtkWidget *widget, GdkDragContext *context, gpointer userdata)
 {
 	int width, height;
-	GdkColormap *cmap;
+	cairo_surface_t *surface;
+	cairo_t *cr;
 	GdkPixbuf *pix, *pix2;
 
 	/* ignore file drops */
 	if (!mg_is_gui_target (context))
 		return FALSE;
 
-	cmap = gtk_widget_get_colormap (widget);
-	width = gdk_window_get_width (gtk_widget_get_window (widget));
-	height = gdk_window_get_height (gtk_widget_get_window (widget));
+	width = gtk_widget_get_allocated_width (widget);
+	height = gtk_widget_get_allocated_height (widget);
 
-	pix = gdk_pixbuf_get_from_drawable (NULL, gtk_widget_get_window (widget), cmap, 0, 0, 0, 0, width, height);
+	/* render the widget into an image to use as the drag icon */
+	surface = cairo_image_surface_create (CAIRO_FORMAT_RGB24, width, height);
+	cr = cairo_create (surface);
+	gtk_widget_draw (widget, cr);
+	cairo_destroy (cr);
+	pix = gdk_pixbuf_get_from_surface (surface, 0, 0, width, height);
+	cairo_surface_destroy (surface);
+	if (!pix)
+		return FALSE;
 	pix2 = gdk_pixbuf_scale_simple (pix, width * 4 / 5, height / 2, GDK_INTERP_HYPER);
 	g_object_unref (pix);
 
@@ -3813,7 +3819,12 @@ mg_drag_end_cb (GtkWidget *widget, GdkDragContext *context, gpointer userdata)
 	if (!mg_is_gui_target (context))
 		return;
 
-	g_object_unref (g_object_get_data (G_OBJECT (widget), "ico"));
+	if (g_object_get_data (G_OBJECT (widget), "ico"))
+	{
+		g_object_unref (g_object_get_data (G_OBJECT (widget), "ico"));
+		g_object_set_data (G_OBJECT (widget), "ico", NULL);
+	}
+	mg_drag_set_half (widget, 0);
 }
 
 /* drop complete */
@@ -3824,6 +3835,8 @@ mg_drag_drop_cb (GtkWidget *widget, GdkDragContext *context, int x, int y, guint
 	/* ignore file drops */
 	if (!mg_is_gui_target (context))
 		return FALSE;
+
+	mg_drag_set_half (widget, 0);
 
 	switch (gdk_drag_context_get_selected_action (context))
 	{
@@ -3842,79 +3855,66 @@ mg_drag_drop_cb (GtkWidget *widget, GdkDragContext *context, int x, int y, guint
 	return TRUE;
 }
 
+/* GTK3 can't draw outside of the draw signal, so the drop highlight is
+ * painted by a draw handler that runs after the widget itself. */
+
+static gboolean
+mg_drag_draw_cb (GtkWidget *widget, cairo_t *cr, gpointer userdata)
+{
+	int half = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (widget), "mg-drag-half"));
+	int width = gtk_widget_get_allocated_width (widget);
+	int height = gtk_widget_get_allocated_height (widget);
+	int h = height / 2;
+	int y = (half == 2) ? h : 0;
+
+	if (!half)
+		return FALSE;
+
+	cairo_set_source_rgba (cr, 0.2, 0.4, 0.8, 0.9);
+	cairo_set_line_width (cr, 1);
+	cairo_rectangle (cr, 1.5, y + 2.5, width - 3, h - 4);
+	cairo_rectangle (cr, 0.5, y + 1.5, width - 1, h - 2);
+	cairo_stroke (cr);
+
+	return FALSE;
+}
+
+static void
+mg_drag_set_half (GtkWidget *widget, int half)
+{
+	if (GPOINTER_TO_INT (g_object_get_data (G_OBJECT (widget), "mg-drag-half")) == half)
+		return;
+
+	if (!g_object_get_data (G_OBJECT (widget), "mg-drag-draw"))
+	{
+		g_object_set_data (G_OBJECT (widget), "mg-drag-draw", GINT_TO_POINTER (1));
+		g_signal_connect_after (G_OBJECT (widget), "draw",
+										G_CALLBACK (mg_drag_draw_cb), NULL);
+		g_signal_connect (G_OBJECT (widget), "drag-leave",
+								G_CALLBACK (mg_drag_leave_cb), NULL);
+	}
+
+	g_object_set_data (G_OBJECT (widget), "mg-drag-half", GINT_TO_POINTER (half));
+	gtk_widget_queue_draw (widget);
+}
+
+static void
+mg_drag_leave_cb (GtkWidget *widget, GdkDragContext *context, guint time, gpointer userdata)
+{
+	mg_drag_set_half (widget, 0);
+}
+
 /* draw highlight rectangle in the destination */
 
 gboolean
 mg_drag_motion_cb (GtkWidget *widget, GdkDragContext *context, int x, int y, guint time, gpointer scbar)
 {
-	GdkGC *gc;
-	GdkColor col;
-	GdkGCValues val;
-	int half, width, height;
-	int ox, oy;
-	GdkDrawable *draw;
-	GtkAllocation allocation;
-
 	/* ignore file drops */
 	if (!mg_is_gui_target (context))
 		return FALSE;
 
-	if (scbar)	/* scrollbar */
-	{
-		gtk_widget_get_allocation (widget, &allocation);
-		ox = allocation.x;
-		oy = allocation.y;
-		width = allocation.width;
-		height = allocation.height;
-		draw = gtk_widget_get_window (widget);
-	}
-	else
-	{
-		ox = oy = 0;
-		width = gdk_window_get_width (gtk_widget_get_window (widget));
-		height = gdk_window_get_height (gtk_widget_get_window (widget));
-		draw = gtk_widget_get_window (widget);
-	}
-
-	val.subwindow_mode = GDK_INCLUDE_INFERIORS;
-	val.graphics_exposures = 0;
-	val.function = GDK_XOR;
-
-	gc = gdk_gc_new_with_values (gtk_widget_get_window (widget), &val, GDK_GC_EXPOSURES | GDK_GC_SUBWINDOW | GDK_GC_FUNCTION);
-	col.red = rand() % 0xffff;
-	col.green = rand() % 0xffff;
-	col.blue = rand() % 0xffff;
-	gdk_colormap_alloc_color (gtk_widget_get_colormap (widget), &col, FALSE, TRUE);
-	gdk_gc_set_foreground (gc, &col);
-
-	half = height / 2;
-
-#if 0
-	/* are both tree/userlist on the same side? */
-	paned = (GtkPaned *)widget->parent->parent;
-	if (paned->child1 != NULL && paned->child2 != NULL)
-	{
-		gdk_draw_rectangle (draw, gc, 0, 1, 2, width - 3, height - 4);
-		gdk_draw_rectangle (draw, gc, 0, 0, 1, width - 1, height - 2);
-		g_object_unref (gc);
-		return TRUE;
-	}
-#endif
-
-	if (y < half)
-	{
-		gdk_draw_rectangle (draw, gc, FALSE, 1 + ox, 2 + oy, width - 3, half - 4);
-		gdk_draw_rectangle (draw, gc, FALSE, 0 + ox, 1 + oy, width - 1, half - 2);
-		gtk_widget_queue_draw_area (widget, ox, half + oy, width, height - half);
-	}
-	else
-	{
-		gdk_draw_rectangle (draw, gc, FALSE, 0 + ox, half + 1 + oy, width - 1, half - 2);
-		gdk_draw_rectangle (draw, gc, FALSE, 1 + ox, half + 2 + oy, width - 3, half - 4);
-		gtk_widget_queue_draw_area (widget, ox, oy, width, half);
-	}
-
-	g_object_unref (gc);
+	/* top or bottom half of the widget */
+	mg_drag_set_half (widget, y < gtk_widget_get_allocated_height (widget) / 2 ? 1 : 2);
 
 	return TRUE;
 }

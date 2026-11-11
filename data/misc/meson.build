@@ -14,8 +14,12 @@ if get_option('gtk-frontend')
 
     appstream_util = find_program('appstream-util', required: false)
     if appstream_util.found()
+      # --nonet: full schema/metadata validation, but do not fetch the remote
+      # screenshot URLs, so the result does not depend on network access.
+      # Availability of those URLs is a separate, manual check (see
+      # docs/maintenance/gtk3-status.md).
       test('Validate io.github.Hexchat.appdata.xml', appstream_util,
-        args: ['validate-relax', hexchat_appdata]
+        args: ['validate-relax', '--nonet', hexchat_appdata]
       )
     endif
   endif

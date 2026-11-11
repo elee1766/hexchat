@@ -618,9 +618,11 @@ ssl_do_connect (server * serv)
 		{
 		case X509_V_OK:
 			{
-				X509 *cert = SSL_get_peer_certificate (serv->ssl);
+				X509 *cert = _SSL_get_peer_cert (serv->ssl);
 				int hostname_err;
-				if ((hostname_err = _SSL_check_hostname(cert, serv->hostname)) != 0)
+				hostname_err = cert ? _SSL_check_hostname (cert, serv->hostname) : -1;
+				X509_free (cert);
+				if (hostname_err != 0)
 				{
 					g_snprintf (buf, sizeof (buf), "* Verify E: Failed to validate hostname? (%d)%s",
 							 hostname_err, serv->accept_invalid_cert ? " -- Ignored" : "");
@@ -669,7 +671,11 @@ conn_fail:
 	} else
 	{
 		SSL_SESSION *session = SSL_get_session (serv->ssl);
+#if OPENSSL_VERSION_NUMBER >= 0x30300000L
+		if (session && SSL_SESSION_get_time_ex (session) + SSLTMOUT < time (NULL))
+#else
 		if (session && SSL_SESSION_get_time (session) + SSLTMOUT < time (NULL))
+#endif
 		{
 			g_snprintf (buf, sizeof (buf), "SSL handshake timed out");
 			EMIT_SIGNAL (XP_TE_CONNFAIL, serv->server_session, buf, NULL,

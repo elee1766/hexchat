@@ -24,7 +24,7 @@ global_deps = []
 if cc.get_id() == 'msvc'
   libssl_dep = cc.find_library('libssl')
 else
-  libssl_dep = dependency('openssl', version: '>= 0.9.8',
+  libssl_dep = dependency('openssl', version: '>= 3.0',
                           required: get_option('tls'))
 endif
 
@@ -44,7 +44,6 @@ config_h.set('USE_DBUS', dbus_glib_dep.found())
 config_h.set('USE_PLUGIN', get_option('plugin'))
 
 config_h.set('G_DISABLE_SINGLE_INCLUDES', true)
-config_h.set('GTK_DISABLE_DEPRECATED', true)
 config_h.set('GTK_DISABLE_SINGLE_INCLUDES', true)
 config_h.set('GDK_PIXBUF_DISABLE_SINGLE_INCLUDES', true)
 config_h.set('GLIB_VERSION_MAX_ALLOWED', 'GLIB_VERSION_2_36')
@@ -57,30 +56,6 @@ config_h.set('HAVE_STRINGS_H', cc.has_header('strings.h'))
 config_h.set_quoted('HEXCHATLIBDIR',
   join_paths(get_option('prefix'), get_option('libdir'), 'hexchat/plugins')
 )
-
-if libssl_dep.found()
-  config_h.set('HAVE_X509_GET_SIGNATURE_NID',
-    cc.has_function('X509_get_signature_nid', dependencies: libssl_dep)
-  )
-  config_h.set('HAVE_SSL_CTX_GET_SSL_METHOD',
-    cc.has_function('SSL_CTX_get_ssl_method', dependencies: libssl_dep)
-  )
-  config_h.set('HAVE_DH_SET0_PQG',
-    cc.has_function('DH_set0_pqg', dependencies: libssl_dep)
-  )
-  config_h.set('HAVE_DH_GET0_KEY',
-    cc.has_function('DH_get0_key', dependencies: libssl_dep)
-  )
-  config_h.set('HAVE_DH_SET0_KEY',
-    cc.has_function('DH_set0_key', dependencies: libssl_dep)
-  )
-  config_h.set('HAVE_ERR_REMOVE_THREAD_STATE',
-    cc.has_function('ERR_remove_thread_state', dependencies: libssl_dep)
-  )
-  config_h.set('HAVE_ASN1_STRING_GET0_DATA',
-    cc.has_function('ASN1_STRING_get0_data', dependencies: libssl_dep)
-  )
-endif
 
 configure_file(output: 'config.h', configuration: config_h)
 config_h_include = include_directories('.')
