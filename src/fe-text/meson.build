@@ -1,4 +1,4 @@
-executable('hexchat-text',
+hexchat_text = executable('hexchat-text',
   sources: [
     'fe-text.c',
   ],

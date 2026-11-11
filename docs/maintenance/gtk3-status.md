@@ -117,9 +117,9 @@ metadata fix, not a code change.
   `GtkStock`, `gtk_table_*` (to `GtkGrid`), `gtk_misc_set_alignment`,
   `gtk_hbox_new`/`gtk_vbox_new`, `gtk_hbutton_box_new`, `*_from_stock`,
   `gtk_adjustment_changed`. No warnings in `common` or the plugins.
-- `src/common/dbus` still uses dbus-glib (unmaintained; builds without
-  warnings). A GDBus port needs a session-bus test of every method and was not
-  attempted.
+- `src/common/dbus` now uses GDBus. Private session-bus tests cover the
+  legacy API, client lifecycle and single-instance forwarding, including
+  the app-id service-name option.
 - Constant-time behaviour of DH1080 relies on OpenSSL's documented contract and
   was not measured.
 - Multi-line selection highlight starts about 7px left of the text indent on

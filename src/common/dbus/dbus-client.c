@@ -55,10 +55,6 @@ new_param_variant (const char *arg)
 
 void
 hexchat_remote (void)
-/* TODO: dbus_g_connection_unref (connection) are commented because it makes
- * dbus to crash. Fixed in dbus >=0.70 ?!?
- * https://launchpad.net/distros/ubuntu/+source/dbus/+bug/54375
- */
 {
 	GDBusConnection *connection;
 	GDBusProxy *dbus = NULL;
@@ -85,13 +81,20 @@ hexchat_remote (void)
 
 	/* Checks if HexChat is already running */
 	dbus = g_dbus_proxy_new_sync (connection,
-								  G_DBUS_PROXY_FLAGS_NONE,
+								  G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES | G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS,
 								  NULL,
 								  DBUS_SERVICE_DBUS,
 								  DBUS_PATH_DBUS,
 								  DBUS_INTERFACE_DBUS,
 								  NULL,
 								  &error);
+
+	if (!dbus)
+	{
+		write_error (_("Failed to connect to bus driver"), &error);
+		g_object_unref (connection);
+		return;
+	}
 
 	ret = g_dbus_proxy_call_sync (dbus, "NameHasOwner",
 								 new_param_variant (DBUS_SERVICE),
@@ -119,7 +122,7 @@ hexchat_remote (void)
 	}
 
 	remote_object = g_dbus_proxy_new_sync (connection,
-								  G_DBUS_PROXY_FLAGS_NONE,
+								  G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES | G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS,
 								  NULL,
 								  DBUS_SERVICE,
 								  DBUS_REMOTE_PATH,
@@ -142,13 +145,14 @@ hexchat_remote (void)
 
 	if (command)
 	{
-		g_dbus_proxy_call_sync (remote_object, "Command",
+		ret = g_dbus_proxy_call_sync (remote_object, "Command",
 								new_param_variant (command),
 								G_DBUS_CALL_FLAGS_NONE,
 								-1,
 								NULL,
 								&error);
 
+		if (ret) g_variant_unref (ret);
 		if (error)
 			write_error (_("Failed to complete Command"), &error);
 		g_free (command);
@@ -160,12 +164,13 @@ hexchat_remote (void)
 		{
 			command = g_strdup_printf ("url %s", arg_urls[i]);
 
-			g_dbus_proxy_call_sync (remote_object, "Command",
+			ret = g_dbus_proxy_call_sync (remote_object, "Command",
 									new_param_variant (command),
 									G_DBUS_CALL_FLAGS_NONE,
 									-1,
 									NULL,
 									&error);
+			if (ret) g_variant_unref (ret);
 			if (error)
 				write_error (_("Failed to complete Command"), &error);
 			g_free (command);
